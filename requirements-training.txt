@@ -1,0 +1,10 @@
+# requirements-training.txt
+# Install ini hanya di LOCAL PC untuk training model
+# pip install -r requirements-training.txt
+
+python-binance==1.0.19
+pandas>=2.0.0
+pandas-ta>=0.3.14b0
+scikit-learn>=1.3.0
+numpy>=1.24.0
+python-dotenv==1.0.1
