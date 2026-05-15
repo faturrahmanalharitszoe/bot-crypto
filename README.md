@@ -1,162 +1,81 @@
-# Binance Scalping Bot 🤖
+# 🚀 AI-Powered Binance Scalping Bot (Multi-Timeframe)
 
-A fully automatic crypto scalping bot built with Python and the Binance API.
-Runs in **Testnet (paper trading) mode** to safely validate the strategy before going live.
-
----
-
-## Strategy
-
-**EMA 9/21 Crossover + RSI 14 + Volume Spike** on 5-minute candles
-
-| Signal | Condition |
-|---|---|
-| 🟢 **BUY**  | EMA9 crosses above EMA21 **AND** RSI < 65 **AND** volume > 1.5× avg |
-| 🔴 **SELL (TP)** | Price rises +1.5% from entry |
-| 🛑 **SELL (SL)** | Price drops -0.8% from entry |
-| 🔁 **SELL (Reversal)** | EMA9 crosses back below EMA21 |
-| ⏰ **SELL (Timeout)** | Position held for 48 candles (~4 hours) |
-
-**Risk/Reward ratio: ~1.87:1**  
-**Max position size: 40% of available USDT balance**  
-**One trade at a time** to protect small capital
+A high-performance, intelligent crypto scalping bot built with Python and Scikit-Learn. This bot doesn't just follow simple indicators; it uses a **RandomForest AI Engine** to analyze market conditions across multiple timeframes simultaneously.
 
 ---
 
-## Setup Guide
+## 🧠 Core Intelligence: The AI Engine
+Unlike standard bots, this bot uses **Machine Learning** to make decisions:
+- **22 Technical Indicators:** Analyzing Trend (EMA, ADX), Momentum (RSI, MACD), Volatility (ATR, BB), and Volume Momentum.
+- **Multi-Timeframe Analysis:** Synchronously monitors **1m (Micro)**, **5m (Execution)**, and **15m (Macro)** intervals.
+- **Self-Optimizing:** Includes an **Auto-Optimizer** that retrains and tunes the model every hour based on the last 24h of market performance.
+
+---
+
+## 🛡️ Advanced Risk Management
+Protecting your capital is the top priority:
+- **Trailing Stop Loss:** Automatically locks in profits by trailing the peak price by a specific percentage.
+- **Break-Even Protection:** Once a small profit target is hit (+0.3%), the SL is moved to the entry price to ensure a risk-free trade.
+- **Trade Cooldown:** Prevents "whipsawing" by enforcing a 15-minute rest period for a symbol after every exit.
+- **Dynamic Exit Logic:** Combines AI signals, EMA reversals, and hard TP/SL caps for the best possible exit.
+
+---
+
+## 📊 Monitoring & Dashboard
+- **Web Dashboard:** Real-time monitoring of your balance, active positions, ML scores, and market watchlist via `http://localhost:5050`.
+- **Telegram Notifications:** Get instant alerts on your phone for every BUY and SELL operation.
+- **Granular Logging:** 
+    - `logs/trades.csv`: Complete history of all closed trades.
+    - `logs/position_history.csv`: Per-minute "journey" data of every open trade for post-trade analysis.
+
+---
+
+## 🛠️ Setup & Installation
 
 ### 1. Prerequisites
+- Python 3.10+
+- Binance API Keys (Testnet or Live)
 
-- Python 3.10 or newer
-- A Binance account
-
-### 2. Install Dependencies
-
+### 2. Install
 ```bash
+git clone https://github.com/faturrahmanalharitszoe/bot-crypto.git
 cd bot-crypto
 pip install -r requirements.txt
 ```
 
-### 3. Get Testnet API Keys
-
-1. Go to [https://testnet.binance.vision](https://testnet.binance.vision)
-2. Log in with your GitHub account
-3. Click **"Generate HMAC_SHA256 Key"**
-4. Copy your **API Key** and **Secret Key**
-
-> ⚠️ Testnet keys are different from your real Binance keys!
-
-### 4. Configure Environment
-
+### 3. Training the AI
+Before running, train the model using current market data:
 ```bash
-# Copy the template
-copy .env.example .env
+python train_model.py
 ```
 
-Edit `.env`:
+### 4. Configuration
+Edit `.env` for API keys and `config.py` for strategy tuning:
 ```env
-BINANCE_API_KEY=your_testnet_api_key_here
-BINANCE_API_SECRET=your_testnet_api_secret_here
+BINANCE_API_KEY=your_api_key
+BINANCE_API_SECRET=your_api_secret
 TESTNET=true
+TELEGRAM_BOT_TOKEN=...
+TELEGRAM_CHAT_ID=...
 ```
 
-### 5. Run the Bot
-
+### 5. Start the Bot
 ```bash
 python main.py
 ```
 
 ---
 
-## Configuration (`config.py`)
-
+## ⚙️ Strategy Parameters (`config.py`)
 | Parameter | Default | Description |
 |---|---|---|
-| `CANDLE_INTERVAL` | `5m` | Scalping timeframe |
-| `EMA_FAST` | `9` | Fast EMA period |
-| `EMA_SLOW` | `21` | Slow EMA period |
-| `RSI_PERIOD` | `14` | RSI lookback |
-| `RSI_OVERBOUGHT` | `65` | Max RSI to allow BUY |
-| `VOLUME_SPIKE_MULTIPLIER` | `1.5` | Volume spike threshold |
-| `MAX_POSITION_PCT` | `0.40` | Max 40% of balance per trade |
-| `TAKE_PROFIT_PCT` | `0.015` | +1.5% take profit |
-| `STOP_LOSS_PCT` | `0.008` | -0.8% stop loss |
-| `TOP_PAIRS_COUNT` | `5` | Number of pairs to watch |
-| `MIN_VOLUME_USDT_24H` | `5,000,000` | Minimum 24h liquidity |
-| `LOOP_INTERVAL_SECONDS` | `30` | Main loop sleep time |
+| `ML_CONFIDENCE_THRESHOLD` | `0.65` | Min AI confidence to allow a BUY |
+| `TRAILING_STOP_ENABLED` | `True` | Protect profits dynamically |
+| `BREAK_EVEN_ENABLED` | `True` | Move SL to entry after +0.3% |
+| `TOP_PAIRS_COUNT` | `20` | Number of high-volume pairs to scan |
+| `OPTIMIZER_INTERVAL_HOURS`| `1` | How often the AI retrains itself |
 
 ---
 
-## Output
-
-### Console Status Banner (every 30 seconds)
-```
-══════════════════════════════════════════════════════════════
-  ⚡ BINANCE SCALPING BOT  🧪 TESTNET  │  Loop #47
-══════════════════════════════════════════════════════════════
-  ⏰ Time       : 2026-05-11 15:45:00
-  💰 USDT Bal   : $24.87
-  📈 Position   : DOGEUSDT
-     Entry      : 0.123400
-     Current    : 0.124800
-     PnL        : +0.1400 USDT  (+1.13%)
-     TP / SL    : 0.125271 / 0.122413
-     Held       : 12.5 min
-══════════════════════════════════════════════════════════════
-```
-
-### Trade Journal (`logs/trades.csv`)
-All trades are automatically saved with:
-- Symbol, entry/exit price, quantity
-- P&L in USDT and percentage
-- Exit reason (TAKE_PROFIT / STOP_LOSS / EMA_REVERSAL / MAX_HOLD)
-- Trade duration in minutes
-
----
-
-## File Structure
-
-```
-bot-crypto/
-├── .env                  # Your API keys (git-ignored)
-├── .env.example          # Key template
-├── .gitignore
-├── requirements.txt
-├── config.py             # All tunable parameters
-├── main.py               # Entry point
-├── bot/
-│   ├── exchange.py       # Binance API wrapper
-│   ├── strategy.py       # EMA + RSI + Volume signals
-│   ├── risk_manager.py   # Position sizing & TP/SL logic
-│   ├── pair_selector.py  # Dynamic pair ranking
-│   ├── trader.py         # Trade orchestration
-│   └── logger.py         # Console + CSV logging
-└── logs/
-    ├── bot.log           # Full debug log
-    └── trades.csv        # Trade history
-```
-
----
-
-## Switching to Live Trading
-
-When you're confident in the strategy results on testnet:
-
-1. Get real API keys from [Binance](https://www.binance.com/en/my/settings/api-management)
-2. Enable **Spot Trading** permission on the key (disable withdrawal!)
-3. Update `.env`:
-   ```env
-   BINANCE_API_KEY=your_REAL_api_key
-   BINANCE_API_SECRET=your_REAL_api_secret
-   TESTNET=false
-   ```
-4. Start with `$25` and monitor closely
-
----
-
-## ⚠️ Risk Disclaimer
-
-Trading cryptocurrencies involves significant risk of financial loss.
-This bot is provided for **educational purposes only**. Past performance on testnet
-does not guarantee future results on live markets. Never trade money you cannot
-afford to lose. The author is not responsible for any financial losses.
+## ⚠️ Disclaimer
+Trading cryptocurrencies involves significant risk. This bot is for **educational purposes only**. The author is not responsible for any financial losses. Always test thoroughly on **Testnet** before using real funds.
