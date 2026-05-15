@@ -10,6 +10,15 @@ Unlike standard bots, this bot uses **Machine Learning** to make decisions:
 - **Multi-Timeframe Analysis:** Synchronously monitors **1m (Micro)**, **5m (Execution)**, and **15m (Macro)** intervals.
 - **Self-Optimizing:** Includes an **Auto-Optimizer** that retrains and tunes the model every hour based on the last 24h of market performance.
 
+### 📈 Latest Training Results
+- **ROC-AUC Score:** `0.7387` (High Predictive Accuracy)
+- **Top 5 Predictive Indicators:**
+  1. `ema_cross_gap` (Trend Strength)
+  2. `atr_norm` (Volatility/Noise Filter)
+  3. `hour` (Time-of-Day Seasonality)
+  4. `dist_ema_slow` (Mean Reversion)
+  5. `rsi_15m` (Macro Trend Confirmation)
+
 ---
 
 ## 🛡️ Advanced Risk Management
