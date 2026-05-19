@@ -11,13 +11,13 @@ Unlike standard bots, this bot uses **Machine Learning** to make decisions:
 - **Self-Optimizing:** Includes an **Auto-Optimizer** that retrains and tunes the model dynamically based on historical market performance.
 
 ### 📈 Latest Training Results
-- **ROC-AUC Score:** `0.7387` (High Predictive Accuracy)
+- **Best Model F1-Score:** `0.7854` (High Balance & Classification Accuracy)
 - **Top 5 Predictive Indicators:**
-  1. `ema_cross_gap` (Trend Strength)
-  2. `atr_norm` (Volatility/Noise Filter)
-  3. `hour` (Time-of-Day Seasonality)
-  4. `dist_ema_slow` (Mean Reversion)
-  5. `rsi_15m` (Macro Trend Confirmation)
+  1. `day_of_week` (9.3% — Weekly Trend Seasonality)
+  2. `hour` (8.3% — Intraday Volume/Volatility Seasonality)
+  3. `rsi_15m` (5.6% — Macro Momentum Confirmation)
+  4. `is_bullish_candle` (5.5% — Price Action Candlestick Structure)
+  5. `ema_cross_gap` (5.1% — Moving Average Trend Deviation)
 
 ---
 
