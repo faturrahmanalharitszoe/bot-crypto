@@ -29,10 +29,10 @@ logger = logging.getLogger("bot")
 # Standard feature set for the model (22 features with MTF)
 FEATURE_COLS = [
     "ema_cross_gap", "ema_cross_angle", "macd_hist", "rsi", "volatility_pct",
-    "volume_spike", "price_change_5", "price_change_3", "hour",
+    "volume_spike", "price_change_5", "price_change_3", "hour", "day_of_week",
     "adx", "bb_pct", "atr_norm", "volume_momentum", "dist_ema_fast",
     "dist_ema_slow", "rsi_slope", "high_low_gap", "is_bullish_candle",
-    "rsi_1m", "rsi_15m", "trend_15m", "vol_1m_spike"
+    "rsi_1m", "rsi_15m", "trend_15m", "vol_1m_spike", "range_pct", "rsi_div"
 ]
 
 class MLPredictor:
@@ -150,8 +150,11 @@ class MLPredictor:
             df['rsi_15m'] = rsi_15m
             df['trend_15m'] = trend_15m
 
-            # Time feature
+            # Additional features to match train_model.py
+            df['rsi_div'] = df['rsi'].diff() - df['close'].diff() / df['close']
             df['hour'] = df.index.hour
+            df['day_of_week'] = df.index.dayofweek
+            df['range_pct'] = (df['high'] - df['low']) / df['close'] * 100
             
             return df[FEATURE_COLS].dropna().iloc[[-1]]
             
@@ -159,23 +162,32 @@ class MLPredictor:
             logger.error(f"Error preparing MTF features: {e}")
             return None
 
-    def predict(self, df_5m: pd.DataFrame, df_1m: pd.DataFrame = None, df_15m: pd.DataFrame = None) -> float:
-        """Predict BUY probability (0.0 to 1.0) using Multi-Timeframe data."""
+    def predict(self, df_5m: pd.DataFrame, df_1m: pd.DataFrame = None, df_15m: pd.DataFrame = None) -> tuple[int, float]:
+        """
+        Predict market direction using Multi-Timeframe data.
+        Returns: (signal_class, confidence)
+        signal_class: 0=HOLD, 1=LONG, 2=SHORT
+        """
         if not self.is_ready:
-            return 0.0
+            return 0, 0.0
             
         features_df = self.prepare_features(df_5m, df_1m, df_15m)
         if features_df is None or features_df.empty:
-            return 0.0
+            return 0, 0.0
             
         try:
-            # Predict probability of class 1 (BUY)
-            probs = self.model.predict_proba(features_df)
-            prob = float(probs[0][1]) # Cast to native float for JSON
-            return prob
+            # Predict probabilities for all classes (0, 1, 2)
+            # Use .values to avoid "feature names" warning
+            probs = self.model.predict_proba(features_df.values)[0]
+            
+            # Find the best class
+            best_class = int(np.argmax(probs))
+            confidence = float(probs[best_class])
+            
+            return best_class, confidence
         except Exception as e:
             logger.error(f"Prediction error: {e}")
-            return 0.0
+            return 0, 0.0
 
     @property
     def is_ready(self) -> bool:

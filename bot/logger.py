@@ -183,12 +183,21 @@ def log_trade(
     quantity: float,
     exit_reason: str,
     duration_min: float,
+    pnl_usdt: float = None,  # If provided, use as-is (side-aware calc from trader.py)
+    pnl_pct:  float = None,
 ) -> None:
     """Append a completed trade to the CSV trade journal."""
     _ensure_trade_log()
 
-    pnl_usdt = (exit_price - entry_price) * quantity
-    pnl_pct  = ((exit_price - entry_price) / entry_price) * 100
+    # Use pre-calculated (side-aware) PnL if provided, else fallback to long formula
+    if pnl_usdt is None or pnl_pct is None:
+        # Fallback: old LONG-only formula (should not happen with updated trader.py)
+        if side == "SELL":  # Short position
+            pnl_usdt = (entry_price - exit_price) * quantity
+            pnl_pct  = ((entry_price - exit_price) / entry_price) * 100
+        else:
+            pnl_usdt = (exit_price - entry_price) * quantity
+            pnl_pct  = ((exit_price - entry_price) / entry_price) * 100
 
     row = {
         "timestamp":    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -210,7 +219,7 @@ def log_trade(
 
     emoji = "✅" if pnl_usdt >= 0 else "❌"
     logger.info(
-        f"{emoji} TRADE CLOSED | {symbol} | {exit_reason} | "
+        f"{emoji} TRADE CLOSED | {symbol} | {side} | {exit_reason} | "
         f"PnL: {pnl_usdt:+.4f} USDT ({pnl_pct:+.2f}%) | "
         f"Duration: {duration_min:.1f}m"
     )

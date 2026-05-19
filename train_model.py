@@ -2,7 +2,9 @@ import os
 import pickle
 import pandas as pd
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timedelta
+import glob
+import glob
 
 # Import local bot components
 from bot.strategy import Strategy
@@ -32,17 +34,32 @@ TRAINING_PAIRS = [
     "LINKUSDT", "LTCUSDT", "ATOMUSDT", "NEARUSDT", "APTUSDT",
     "ARBUSDT", "OPUSDT", "SUIUSDT", "INJUSDT", "TIAUSDT",
     "SEIUSDT", "FETUSDT", "WLDUSDT", "PENDLEUSDT", "ORDIUSDT",
+    "PEPEUSDT", "SHIBUSDT", "RENDERUSDT", "STXUSDT", "FILUSDT",
+    "NEARUSDT", "GRTUSDT", "ICPUSDT", "GALAUSDT", "LDOUSDT",
 ]
 
 
-def fetch_klines(client, symbol: str, interval: str = "5m") -> pd.DataFrame:
-    """Fetch OHLCV klines from Binance."""
+def fetch_klines(client, symbol: str, interval: str = "5m", days: int = 14, end_time: str = None) -> pd.DataFrame:
+    """Fetch historical OHLCV klines from Binance (multi-page)."""
     try:
-        klines = client.get_klines(
-            symbol=symbol,
-            interval=interval,
-            limit=CANDLE_LIMIT,
-        )
+        # Calculate start time
+        start_str = f"{days} days ago UTC"
+        if end_time is not None:
+            klines = client.get_historical_klines(
+                symbol=symbol,
+                interval=interval,
+                start_str=start_str,
+                end_str=end_time
+            )
+        else:
+            klines = client.get_historical_klines(
+                symbol=symbol,
+                interval=interval,
+                start_str=start_str
+            )
+         
+        if not klines: return pd.DataFrame()
+ 
         df = pd.DataFrame(klines, columns=[
             "open_time", "open", "high", "low", "close", "volume",
             "close_time", "quote_vol", "trades", "tb_base_vol",
@@ -117,7 +134,12 @@ def build_features(df_5m: pd.DataFrame, df_1m: pd.DataFrame, df_15m: pd.DataFram
     df_15m_feat['trend_15m'] = (ema_15m_f > ema_15m_s).astype(int).replace(0, -1).reindex(df.index, method='ffill')
 
     df = pd.concat([df, df_1m_feat, df_15m_feat], axis=1)
+    
+    # RSI Divergence (Simple)
+    df['rsi_div'] = df['rsi'].diff() - df['close'].diff() / df['close']
     df['hour'] = df.index.hour
+    df['day_of_week'] = df.index.dayofweek
+    df['range_pct'] = (df['high'] - df['low']) / df['close'] * 100
     
     return df
 
@@ -125,19 +147,86 @@ def build_features(df_5m: pd.DataFrame, df_1m: pd.DataFrame, df_15m: pd.DataFram
 # Standard feature set for the model (22 features now)
 FEATURE_COLS = [
     "ema_cross_gap", "ema_cross_angle", "macd_hist", "rsi", "volatility_pct",
-    "volume_spike", "price_change_5", "price_change_3", "hour",
+    "volume_spike", "price_change_5", "price_change_3", "hour", "day_of_week",
     "adx", "bb_pct", "atr_norm", "volume_momentum", "dist_ema_fast",
     "dist_ema_slow", "rsi_slope", "high_low_gap", "is_bullish_candle",
-    "rsi_1m", "rsi_15m", "trend_15m", "vol_1m_spike"
+    "rsi_1m", "rsi_15m", "trend_15m", "vol_1m_spike", "range_pct", "rsi_div"
 ]
 
 
 def build_labels(df: pd.DataFrame) -> pd.Series:
     """
-    Create binary label: 1 if price rises > LABEL_THRESHOLD in next N candles.
+    Create multi-class labels:
+    1: LONG (price rises > threshold)
+    2: SHORT (price falls > threshold)
+    0: HOLD (otherwise)
     """
     future_return = df["close"].shift(-LABEL_HORIZON) / df["close"] - 1
-    return (future_return > LABEL_THRESHOLD).astype(int)
+    
+    labels = np.zeros(len(df))
+    labels[future_return > LABEL_THRESHOLD] = 1
+    labels[future_return < -LABEL_THRESHOLD] = 2
+    return pd.Series(labels, index=df.index)
+
+
+def load_trade_data(client):
+    """Load and process trade data from logs directory."""
+    import glob
+    trade_files = glob.glob("bot-crypto/logs/trades*.csv")
+    all_X_trade = []
+    all_y_trade = []
+    
+    for file in trade_files:
+        try:
+            df_trades = pd.read_csv(file)
+        except Exception as e:
+            print(f"  ⚠️  Failed to read {file}: {e}")
+            continue
+            
+        for _, row in df_trades.iterrows():
+            try:
+                # Parse the timestamp
+                trade_time = pd.to_datetime(row['timestamp'])
+                symbol = row['symbol']
+                # Fetch klines up to the trade_time
+                df_5m = fetch_klines(client, symbol, interval="5m", days=14, end_time=trade_time.strftime("%Y-%m-%d %H:%M:%S"))
+                df_1m = fetch_klines(client, symbol, interval="1m", days=14, end_time=trade_time.strftime("%Y-%m-%d %H:%M:%S"))
+                df_15m = fetch_klines(client, symbol, interval="15m", days=14, end_time=trade_time.strftime("%Y-%m-%d %H:%M:%S"))
+
+                # Check if we have enough data
+                if len(df_5m) < MIN_CANDLES or len(df_1m) < MIN_CANDLES or len(df_15m) < MIN_CANDLES:
+                    continue
+
+                # Build features for the entire dataframes (we need the last row)
+                df_features = build_features(df_5m, df_1m, df_15m)
+                # We want the last row (which corresponds to the trade_time or the last kline before)
+                if df_features.empty:
+                    continue
+                last_features = df_features.iloc[[-1]]  # This is a DataFrame with one row
+
+                # Determine the label
+                pnl = row['pnl_usdt']
+                side = row['side']
+                if side == 'BUY' and pnl > 0:
+                    label = 1   # LONG
+                elif side == 'SELL' and pnl > 0:
+                    label = 2   # SHORT
+                else:
+                    label = 0   # HOLD (unprofitable trade)
+
+                # Append
+                all_X_trade.append(last_features[FEATURE_COLS].values)
+                all_y_trade.append(label)
+            except Exception as e:
+                print(f"  ⚠️  Failed to process trade {row['timestamp']} {row['symbol']}: {e}")
+                continue
+
+    if all_X_trade:
+        X_trade = np.vstack(all_X_trade)
+        y_trade = np.concatenate(all_y_trade)
+        return X_trade, y_trade
+    else:
+        return np.array([]), np.array([])
 
 
 def main():
@@ -180,30 +269,57 @@ def main():
 
     X_all = np.vstack(all_X)
     y_all = np.concatenate(all_y)
-    print(f"📈 Total samples: {len(X_all):,} | BUY rate: {y_all.mean():.1%}")
+    
+    # Load trade data
+    print(f"\n📈 Loading trade data from logs...")
+    X_trade, y_trade = load_trade_data(client)
+    if len(X_trade) > 0:
+        print(f"   Loaded {len(X_trade)} trade samples")
+        # Combine
+        X_all = np.vstack([X_all, X_trade])
+        y_all = np.concatenate([y_all, y_trade])
+    else:
+        print("   No trade data loaded")
+    
+    long_rate = (y_all == 1).mean()
+    short_rate = (y_all == 2).mean()
+    print(f"📈 Total samples: {len(X_all):,} | LONG: {long_rate:.1%} | SHORT: {short_rate:.1%}")
 
     # ── Hyperparameter Tuning Loop ────────────────────────────
-    from sklearn.ensemble import RandomForestClassifier
+    # ExtraTrees is often better for trading data noise
+    from sklearn.ensemble import ExtraTreesClassifier
     from sklearn.model_selection import cross_val_score
-    from sklearn.preprocessing import StandardScaler
+    from sklearn.preprocessing import RobustScaler
     from sklearn.pipeline import Pipeline
+    
+    # Check for SMOTE
+    try:
+        from imblearn.over_sampling import SMOTE
+        print("\n🪄 SMOTE balancing enabled...")
+        sm = SMOTE(random_state=42)
+        X_res, y_res = sm.fit_resample(X_all, y_all)
+        print(f"   Samples after SMOTE: {len(X_res):,} (Balanced)")
+    except ImportError:
+        print("\n⚠️  INSTALL 'imbalanced-learn' SEKARANG: pip install imbalanced-learn")
+        X_res, y_res = X_all, y_all
 
     best_score = -1
     best_pipe = None
     
-    # Grid of parameters to try
+    # More aggressive grid
     param_grid = [
-        {"n_estimators": 100, "max_depth": 5},
-        {"n_estimators": 200, "max_depth": 8},
-        {"n_estimators": 150, "max_depth": 12},
+        {"n_estimators": 200, "max_depth": 10},
         {"n_estimators": 300, "max_depth": 15},
+        {"n_estimators": 400, "max_depth": 20},
+        {"n_estimators": 500, "max_depth": 25},
+        {"n_estimators": 600, "max_depth": 15},
     ]
 
     print("\n🔍 Tuning model for best performance...")
     for params in param_grid:
         pipe = Pipeline([
-            ("scaler", StandardScaler()),
-            ("clf", RandomForestClassifier(
+            ("scaler", RobustScaler()),
+            ("clf", ExtraTreesClassifier(
                 **params,
                 class_weight="balanced",
                 random_state=42,
@@ -211,19 +327,19 @@ def main():
             ))
         ])
         
-        # We use ROC-AUC as it's better for imbalanced trading data
-        scores = cross_val_score(pipe, X_all, y_all, cv=3, scoring="roc_auc")
+        # Cross-validation on balanced data
+        scores = cross_val_score(pipe, X_res, y_res, cv=3, scoring="f1_macro")
         avg_score = scores.mean()
         
-        print(f"   Testing: {params} → ROC-AUC: {avg_score:.4f}")
+        print(f"   Testing: {params} → F1-Score: {avg_score:.4f}")
         
         if avg_score > best_score:
             best_score = avg_score
             best_pipe = pipe
 
     # ── Final Report ──────────────────────────────────────────
-    print(f"\n🏆 Best Model Found! ROC-AUC: {best_score:.4f}")
-    best_pipe.fit(X_all, y_all)
+    print(f"\n🏆 Best Model Found! F1-Score: {best_score:.4f}")
+    best_pipe.fit(X_res, y_res) # Fit on balanced data
     
     print("\n🧠 AI Logic (Top Features):")
     importances = best_pipe.named_steps["clf"].feature_importances_

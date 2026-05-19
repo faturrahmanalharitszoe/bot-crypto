@@ -58,30 +58,35 @@ def select_best_pairs(exchange) -> List[str]:
 
         # ── Parse numeric fields ──────────────────────────
         try:
-            change_pct   = float(t["priceChangePercent"])
-            volume_usdt  = float(t["quoteVolume"])        # 24h volume in USDT
-            # 3. Liquidity check (Minimum 24h volume)
-            # We lower this to $2M to catch newer/smaller memecoins
-            # 3. Liquidity check (Minimum 24h volume)
-            # We lower this to $2M to catch newer/smaller memecoins
+            # Skip non-TRADING pairs (delisted/suspended) — zero volume is the signal
             vol_24h = float(t["quoteVolume"])
-            if vol_24h < 2_000_000: continue
+            trade_count = int(t.get("count", 1))
+            if vol_24h == 0 or trade_count == 0:
+                continue
 
-            # 4. Anti-Pump Filter (Anti-FOMO / Anti-Rugpull)
-            # If a coin pumped >30% in 24h, it's risky to entry now
+            min_vol = 10_000 if config.TESTNET else 2_000_000
+            if vol_24h < min_vol:
+                continue
+
+            # Anti-Pump Filter: skip if pumped >30% in 24h
             price_change_pct = float(t["priceChangePercent"])
             if price_change_pct > 30.0:
                 continue
-            
-            # 5. Volatility check (Must have some movement)
+
+            # Volatility check (must have some movement)
             high = float(t["highPrice"])
             low  = float(t["lowPrice"])
+            if low <= 0:
+                continue
             volatility = ((high - low) / low) * 100
-            if volatility < 2.0: continue
-            
-            # 6. Skip dust-level prices
+            if volatility < 2.0:
+                continue
+
+            # Skip dust-level prices
             if float(t["lastPrice"]) < 0.00001:
                 continue
+
+            change_pct = price_change_pct
         except (ValueError, KeyError):
             continue
 

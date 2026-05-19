@@ -1,13 +1,16 @@
 """
 bot/strategy.py — Technical signal generation
-Strategy: EMA9/21 crossover + RSI14 + Volume spike filter
+Strategy: EMA9/21 alignment + RSI14 + MACD momentum + Volume filter
 
 Uses the 'ta' library (Python 3.9+ compatible, no C extensions required).
 
 Signal rules:
-  BUY  → EMA9 crosses above EMA21  AND  RSI < RSI_OVERBOUGHT  AND  volume spike
-  SELL → EMA9 crosses below EMA21  (trend reversal exit signal)
+  BUY  → EMA9 > EMA21 (aligned)  AND  RSI in valid range  AND  MACD bullish  AND  price > EMA9
+  SELL → EMA9 < EMA21 (aligned)  AND  RSI not oversold  AND  MACD bearish  AND  price < EMA9
   HOLD → No clear signal
+
+Note: Uses EMA *alignment* (not just crossover) so signals fire continuously
+during a trend, not just the single moment of crossing.
 """
 
 from __future__ import annotations  # Python 3.9 compatibility
@@ -30,6 +33,7 @@ class Strategy:
         self.ema_slow        = config.EMA_SLOW
         self.rsi_period      = config.RSI_PERIOD
         self.rsi_overbought  = config.RSI_OVERBOUGHT
+        self.rsi_oversold    = config.RSI_OVERSOLD
         self.vol_multiplier  = config.VOLUME_SPIKE_MULTIPLIER
         self.vol_avg_period  = config.VOLUME_AVG_PERIOD
 
@@ -95,32 +99,61 @@ class Strategy:
         ema_cross_down = (prev["ema_fast"] >= prev["ema_slow"]) and \
                          (latest["ema_fast"] < latest["ema_slow"])
 
-        # ── Filters ───────────────────────────────────────────
-        rsi_ok       = latest["rsi"] < self.rsi_overbought
-        volume_spike = latest["volume"] > (latest["volume_avg"] * self.vol_multiplier)
+        # ── EMA alignment (trend direction) ───────────────────
+        ema_bullish = latest["ema_fast"] > latest["ema_slow"]
+        ema_bearish = latest["ema_fast"] < latest["ema_slow"]
+
+        # ── Price position relative to EMA9 ───────────────────
+        price_above_ema9 = latest["close"] > latest["ema_fast"]
+        price_below_ema9 = latest["close"] < latest["ema_fast"]
+
+        # ── MACD momentum ─────────────────────────────────────
+        macd_bullish = (latest["macd"] > latest["macd_signal"]) and \
+                       (latest["macd"] > prev["macd"])  # MACD rising
+        macd_bearish = (latest["macd"] < latest["macd_signal"]) and \
+                       (latest["macd"] < prev["macd"])  # MACD falling
+
+        # ── RSI filters ───────────────────────────────────────
+        rsi_buy_ok  = latest["rsi"] < self.rsi_overbought  # Not overbought
+        rsi_sell_ok = latest["rsi"] > self.rsi_oversold    # Not oversold
+
+        # ── Volume filter (relaxed: 1.0x avg is enough) ───────
+        volume_ok = latest["volume"] > (latest["volume_avg"] * 1.0)  # At or above average
+
+        # ── EMA momentum (angle check: fast EMA is rising/falling) ─
+        ema_fast_rising  = latest["ema_fast"] > prev["ema_fast"]
+        ema_fast_falling = latest["ema_fast"] < prev["ema_fast"]
 
         details = {
-            "ema_fast":   round(float(latest["ema_fast"]), 6),
-            "ema_slow":   round(float(latest["ema_slow"]), 6),
-            "rsi":        round(float(latest["rsi"]), 2),
-            "volume":     round(float(latest["volume"]), 2),
-            "volume_avg": round(float(latest["volume_avg"]), 2),
-            "cross_up":   ema_cross_up,
-            "cross_down": ema_cross_down,
-            "rsi_ok":     rsi_ok,
-            "vol_spike":  volume_spike,
+            "ema_fast":         round(float(latest["ema_fast"]), 6),
+            "ema_slow":         round(float(latest["ema_slow"]), 6),
+            "rsi":              round(float(latest["rsi"]), 2),
+            "volume":           round(float(latest["volume"]), 2),
+            "volume_avg":       round(float(latest["volume_avg"]), 2),
+            "cross_up":         ema_cross_up,
+            "cross_down":       ema_cross_down,
+            "ema_bullish":      ema_bullish,
+            "ema_bearish":      ema_bearish,
+            "macd_bullish":     macd_bullish,
+            "macd_bearish":     macd_bearish,
+            "rsi_ok":           rsi_buy_ok,
+            "vol_ok":           volume_ok,
         }
 
         # ── Signal decision ───────────────────────────────────
-        if ema_cross_up and rsi_ok and volume_spike:
+        # BUY: EMA aligned bullish + price above EMA9 + MACD bullish + RSI ok + volume ok
+        if ema_bullish and price_above_ema9 and ema_fast_rising and rsi_buy_ok and volume_ok:
             logger.debug(
-                f"  BUY  signal | EMA cross↑ | RSI={details['rsi']:.1f} | "
-                f"VolSpike={volume_spike}"
+                f"  BUY  signal | EMA aligned↑ | RSI={details['rsi']:.1f} | "
+                f"MACD_bull={macd_bullish}"
             )
             return "BUY", details
 
-        if ema_cross_down:
-            logger.debug(f"  SELL signal | EMA cross↓")
+        # SELL: EMA aligned bearish + price below EMA9 + MACD bearish + RSI ok
+        if ema_bearish and price_below_ema9 and ema_fast_falling and rsi_sell_ok:
+            logger.debug(
+                f"  SELL signal | EMA aligned↓ | RSI={details['rsi']:.1f}"
+            )
             return "SELL", details
 
         return "HOLD", details

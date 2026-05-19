@@ -37,12 +37,20 @@ class Exchange:
         )
 
         # ── Sync clock offset with Binance server ─────────
-        # Fixes error -1021 "Timestamp outside recvWindow"
-        # which happens when PC clock drifts from server time.
         self._sync_server_time()
 
+        # Cache futures symbols for hybrid mode
+        self.futures_symbols = set()
+        try:
+            f_info = self.client.futures_exchange_info()
+            self.futures_symbols = {s['symbol'] for s in f_info['symbols']}
+            logger.info(f"✅ Hybrid Engine: {len(self.futures_symbols)} Futures symbols cached.")
+        except Exception as e:
+            logger.warning(f"Could not fetch Futures symbols: {e}. Falling back to Spot only.")
+
         mode = "🧪 TESTNET" if self.testnet else "🔴 LIVE"
-        logger.info(f"Exchange initialized — Mode: {mode}")
+        market = "📈 FUTURES (Hybrid)" if config.FUTURES_ENABLED else "💰 SPOT"
+        logger.info(f"Exchange initialized — Mode: {mode} | Market: {market}")
         self._symbol_info_cache: dict = {}
 
     # ── Server Time Sync ─────────────────────────────────────
@@ -68,10 +76,21 @@ class Exchange:
     # ── Balance ──────────────────────────────────────────────
 
     def get_usdt_balance(self) -> float:
-        """Return available USDT balance."""
+        """Return available USDT balance (Spot or Futures)."""
         try:
-            info = self.client.get_asset_balance(asset="USDT")
-            return float(info["free"]) if info else 0.0
+            if config.FUTURES_ENABLED:
+                info = self.client.futures_account_balance()
+                # Find USDT in the list of assets
+                for asset in info:
+                    if asset["asset"] == "USDT":
+                        # Try multiple possible keys (withdrawAvailable, availableBalance, balance)
+                        return float(asset.get("withdrawAvailable") or 
+                                     asset.get("availableBalance") or 
+                                     asset.get("balance") or 0.0)
+                return 0.0
+            else:
+                info = self.client.get_asset_balance(asset="USDT")
+                return float(info["free"]) if info else 0.0
         except BinanceAPIException as e:
             logger.error(f"Failed to fetch USDT balance: {e}")
             return 0.0
@@ -85,6 +104,49 @@ class Exchange:
             logger.error(f"Failed to fetch {asset} balance: {e}")
             return 0.0
 
+    # ── Funding Fee ───────────────────────────────────────────
+
+    def get_funding_info(self, symbol: str) -> dict:
+        """
+        Fetch current funding rate and time until next funding for a Futures symbol.
+
+        Returns:
+            {
+                "rate":           float   — current funding rate (e.g. 0.0001 = 0.01%)
+                "next_funding_ms": int    — next funding timestamp in milliseconds
+                "minutes_until":  float  — minutes until next funding event
+                "available":      bool   — False if symbol is Spot-only or fetch failed
+            }
+        """
+        default = {"rate": 0.0, "next_funding_ms": 0, "minutes_until": 999.0, "available": False}
+        if not self.is_futures(symbol):
+            return default
+        try:
+            data = self.client.futures_mark_price(symbol=symbol)
+            rate            = float(data.get("lastFundingRate", 0))
+            next_ms         = int(data.get("nextFundingTime", 0))
+            now_ms          = int(time.time() * 1000)
+            minutes_until   = max(0.0, (next_ms - now_ms) / 60_000)
+            return {
+                "rate":            rate,
+                "next_funding_ms": next_ms,
+                "minutes_until":   round(minutes_until, 1),
+                "available":       True,
+            }
+        except Exception as e:
+            logger.debug(f"Funding info fetch failed for {symbol}: {e}")
+            return default
+
+    def get_mark_price(self, symbol: str) -> float:
+        """Return the mark price for a Futures symbol (used for funding fee calculation)."""
+        if not self.is_futures(symbol):
+            return self.get_current_price(symbol)
+        try:
+            data = self.client.futures_mark_price(symbol=symbol)
+            return float(data.get("markPrice", 0))
+        except Exception:
+            return self.get_current_price(symbol)
+
     # ── Market Data ──────────────────────────────────────────
 
     def get_klines(self, symbol: str, interval: str = None) -> pd.DataFrame:
@@ -94,11 +156,21 @@ class Exchange:
         """
         target_interval = interval if interval else config.CANDLE_INTERVAL
         try:
-            raw = self.client.get_klines(
-                symbol=symbol,
-                interval=target_interval,
-                limit=config.CANDLE_LIMIT,
-            )
+            # Smart check: Use futures if enabled AND symbol exists there
+            use_f = config.FUTURES_ENABLED and self.is_futures(symbol)
+            
+            if use_f:
+                raw = self.client.futures_klines(
+                    symbol=symbol,
+                    interval=target_interval,
+                    limit=config.CANDLE_LIMIT,
+                )
+            else:
+                raw = self.client.get_klines(
+                    symbol=symbol,
+                    interval=target_interval,
+                    limit=config.CANDLE_LIMIT,
+                )
         except BinanceAPIException as e:
             logger.error(f"Failed to fetch klines for {symbol}: {e}")
             return pd.DataFrame()
@@ -118,34 +190,48 @@ class Exchange:
         return df[["open", "high", "low", "close", "volume"]]
 
     def get_current_price(self, symbol: str) -> float:
-        """Return the latest price for a symbol."""
+        """Return the latest price for a symbol (Hybrid)."""
         try:
-            ticker = self.client.get_symbol_ticker(symbol=symbol)
+            use_f = config.FUTURES_ENABLED and self.is_futures(symbol)
+            if use_f:
+                ticker = self.client.futures_symbol_ticker(symbol=symbol)
+            else:
+                ticker = self.client.get_symbol_ticker(symbol=symbol)
             return float(ticker["price"])
         except BinanceAPIException as e:
             logger.error(f"Failed to fetch price for {symbol}: {e}")
             return 0.0
 
     def get_24h_tickers(self) -> list:
-        """Return 24h ticker stats for all symbols."""
+        """Return 24h ticker stats from Spot (which includes most coins)."""
         try:
+            # We use Spot tickers as the base because it covers almost everything
             return self.client.get_ticker()
         except BinanceAPIException as e:
             logger.error(f"Failed to fetch 24h tickers: {e}")
             return []
+
+    def is_futures(self, symbol: str) -> bool:
+        """Check if a symbol is available on the Futures market."""
+        return symbol in self.futures_symbols
 
     # ── Symbol Info ──────────────────────────────────────────
 
     def get_symbol_info(self, symbol: str) -> Optional[dict]:
         """
         Return exchange filters for a symbol (cached).
-        Extracts: step_size, min_qty, min_notional, price_precision.
         """
         if symbol in self._symbol_info_cache:
             return self._symbol_info_cache[symbol]
 
         try:
-            info = self.client.get_symbol_info(symbol)
+            use_f = config.FUTURES_ENABLED and self.is_futures(symbol)
+            if use_f:
+                exchange_info = self.client.futures_exchange_info()
+            else:
+                exchange_info = self.client.get_exchange_info()
+                
+            info = next((s for s in exchange_info['symbols'] if s['symbol'] == symbol), None)
             if not info:
                 return None
 
@@ -158,60 +244,79 @@ class Exchange:
 
             for f in info.get("filters", []):
                 ftype = f.get("filterType")
-                if ftype == "LOT_SIZE":
+                if ftype in ("LOT_SIZE", "MARKET_LOT_SIZE"):
                     parsed["step_size"] = float(f["stepSize"])
                     parsed["min_qty"]   = float(f["minQty"])
-                    # Calculate decimal precision from stepSize
                     step = float(f["stepSize"])
                     if step < 1:
                         parsed["base_precision"] = int(round(-math.log10(step)))
                     else:
                         parsed["base_precision"] = 0
-
                 elif ftype in ("MIN_NOTIONAL", "NOTIONAL"):
-                    parsed["min_notional"] = float(
-                        f.get("minNotional", f.get("minNotional", 5.0))
-                    )
+                    parsed["min_notional"] = float(f.get("minNotional", f.get("notional", 5.0)))
 
             self._symbol_info_cache[symbol] = parsed
             return parsed
 
-        except BinanceAPIException as e:
+        except Exception as e:
             logger.error(f"Failed to fetch symbol info for {symbol}: {e}")
             return None
 
+    # ── Futures Specific ─────────────────────────────────────
+
+    def setup_futures_symbol(self, symbol: str) -> bool:
+        """Set leverage and margin type for a futures symbol."""
+        if not config.FUTURES_ENABLED: return True
+        try:
+            # 1. Set Margin Type
+            try:
+                self.client.futures_change_margin_type(
+                    symbol=symbol, 
+                    marginType=config.FUTURES_MARGIN_TYPE
+                )
+            except BinanceAPIException as e:
+                if "No need to change margin type" not in str(e):
+                    logger.warning(f"Could not set margin type for {symbol}: {e}")
+
+            # 2. Set Leverage
+            self.client.futures_change_leverage(
+                symbol=symbol, 
+                leverage=config.FUTURES_LEVERAGE
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Failed to setup futures for {symbol}: {e}")
+            return False
+
     # ── Orders ───────────────────────────────────────────────
 
-    def place_market_buy(self, symbol: str, quantity: float) -> Optional[dict]:
-        """Place a market BUY order. Returns the order dict or None on failure."""
+    def place_market_order(self, symbol: str, side: str, quantity: float) -> Optional[dict]:
+        """Place a market BUY/SELL order (Auto-routes to Spot or Futures)."""
         try:
-            order = self.client.order_market_buy(
-                symbol=symbol,
-                quantity=quantity,
-            )
-            logger.info(
-                f"🟢 BUY  | {symbol} | Qty: {quantity} | "
-                f"Status: {order.get('status')}"
-            )
+            use_f = config.FUTURES_ENABLED and self.is_futures(symbol)
+            
+            if use_f:
+                # Ensure leverage/margin is set first
+                self.setup_futures_symbol(symbol)
+                order = self.client.futures_create_order(
+                    symbol=symbol,
+                    side=side,
+                    type='MARKET',
+                    quantity=quantity
+                )
+            else:
+                # Spot market execution
+                if side == "BUY":
+                    order = self.client.order_market_buy(symbol=symbol, quantity=quantity)
+                else:
+                    order = self.client.order_market_sell(symbol=symbol, quantity=quantity)
+            
+            emoji = "🟢" if side == "BUY" else "🔴"
+            market_label = "[F]" if use_f else "[S]"
+            logger.info(f"{emoji} {side} {market_label} | {symbol} | Qty: {quantity} | Status: {order.get('status')}")
             return order
-        except (BinanceAPIException, BinanceOrderException) as e:
-            logger.error(f"Market BUY failed for {symbol}: {e}")
-            return None
-
-    def place_market_sell(self, symbol: str, quantity: float) -> Optional[dict]:
-        """Place a market SELL order. Returns the order dict or None on failure."""
-        try:
-            order = self.client.order_market_sell(
-                symbol=symbol,
-                quantity=quantity,
-            )
-            logger.info(
-                f"🔴 SELL | {symbol} | Qty: {quantity} | "
-                f"Status: {order.get('status')}"
-            )
-            return order
-        except (BinanceAPIException, BinanceOrderException) as e:
-            logger.error(f"Market SELL failed for {symbol}: {e}")
+        except Exception as e:
+            logger.error(f"Market {side} failed for {symbol}: {e}")
             return None
 
     def get_filled_price(self, order: dict) -> float:
