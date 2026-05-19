@@ -1,6 +1,6 @@
-# 🚀 AI-Powered Binance Scalping Bot (Multi-Timeframe)
+# 🚀 AI-Powered Binance Scalping Bot (Spot & Futures)
 
-A high-performance, intelligent crypto scalping bot built with Python and Scikit-Learn. This bot doesn't just follow simple indicators; it uses a **RandomForest AI Engine** to analyze market conditions across multiple timeframes simultaneously.
+A high-performance, intelligent crypto scalping bot built with Python and Scikit-Learn. This bot doesn't just follow simple indicators; it uses a **RandomForest AI Engine** to analyze market conditions across multiple timeframes simultaneously, supporting both **Binance Spot** and **USDⓈ-M Futures** (Long & Short positions).
 
 ---
 
@@ -8,7 +8,7 @@ A high-performance, intelligent crypto scalping bot built with Python and Scikit
 Unlike standard bots, this bot uses **Machine Learning** to make decisions:
 - **22 Technical Indicators:** Analyzing Trend (EMA, ADX), Momentum (RSI, MACD), Volatility (ATR, BB), and Volume Momentum.
 - **Multi-Timeframe Analysis:** Synchronously monitors **1m (Micro)**, **5m (Execution)**, and **15m (Macro)** intervals.
-- **Self-Optimizing:** Includes an **Auto-Optimizer** that retrains and tunes the model every hour based on the last 24h of market performance.
+- **Self-Optimizing:** Includes an **Auto-Optimizer** that retrains and tunes the model dynamically based on historical market performance.
 
 ### 📈 Latest Training Results
 - **ROC-AUC Score:** `0.7387` (High Predictive Accuracy)
@@ -21,21 +21,22 @@ Unlike standard bots, this bot uses **Machine Learning** to make decisions:
 
 ---
 
-## 🛡️ Advanced Risk Management
+## 🛡️ Advanced Risk Management & Capital Protection
 Protecting your capital is the top priority:
-- **Trailing Stop Loss:** Automatically locks in profits by trailing the peak price by a specific percentage.
-- **Break-Even Protection:** Once a small profit target is hit (+0.3%), the SL is moved to the entry price to ensure a risk-free trade.
-- **Trade Cooldown:** Prevents "whipsawing" by enforcing a 15-minute rest period for a symbol after every exit.
-- **Dynamic Exit Logic:** Combines AI signals, EMA reversals, and hard TP/SL caps for the best possible exit.
+- **Binance USDⓈ-M Futures Integration:** Supports leveraged Long/Short positions, automatically configuring cross margin, leverage (default 5x), and size calculations.
+- **Enhanced TP/SL Mechanics:** Futures positions feature optimized Take Profit (up to +10%) and trailing SL.
+- **Break-Even Protection:** Moves Stop Loss to entry price after hitting a small target (+0.3%) for risk-free runs.
+- **Funding Fee Avoidance:** Blocks entry when funding rate is excessively high or when settlement is imminent (within 30 minutes) to avoid funding bleed.
+- **Trade Cooldown:** Prevents "whipsawing" by enforcing a rest period for a symbol after every exit.
 
 ---
 
-## 📊 Monitoring & Dashboard
-- **Web Dashboard:** Real-time monitoring of your balance, active positions, ML scores, and market watchlist via `http://localhost:5050`.
-- **Telegram Notifications:** Get instant alerts on your phone for every BUY and SELL operation.
-- **Granular Logging:** 
-    - `logs/trades.csv`: Complete history of all closed trades.
-    - `logs/position_history.csv`: Per-minute "journey" data of every open trade for post-trade analysis.
+## 📊 Monitoring & Web Dashboard
+- **Real-Time Web Dashboard:** Access at `http://localhost:5050` (or VPS IP) featuring a premium glassmorphic dark-theme UI.
+- **Server-Side Global Stats:** Track accurate total Session P&L and Win Rates computed from the entire trade log history, not just the active page.
+- **Interactive Pagination:** Advanced datatable pagination with a customizable rows-per-page dropdown (10, 25, 50, or 100 entries).
+- **Telegram Notifications:** Receives instant messages with P&L details and reasons for entry/exit for every transaction.
+- **Historical Recalculator (`repair_trades.py`):** Dedicated utility to repair and audit corrupted `trades.csv` entries, recalculating true entry prices and real-world P&L.
 
 ---
 
@@ -53,24 +54,36 @@ pip install -r requirements.txt
 ```
 
 ### 3. Training the AI
-Before running, train the model using current market data:
+Train the model with fresh market data before running:
 ```bash
 python train_model.py
 ```
 
 ### 4. Configuration
-Edit `.env` for API keys and `config.py` for strategy tuning:
+Create a `.env` file based on `.env.example`:
 ```env
 BINANCE_API_KEY=your_api_key
 BINANCE_API_SECRET=your_api_secret
 TESTNET=true
-TELEGRAM_BOT_TOKEN=...
-TELEGRAM_CHAT_ID=...
+TELEGRAM_BOT_TOKEN=your_telegram_bot_token
+TELEGRAM_CHAT_ID=your_telegram_chat_id
 ```
 
-### 5. Start the Bot
+Configure strategy parameters in `config.py`:
+- `TRADE_FUTURES`: Toggle between Spot and USDⓈ-M Futures.
+- `LEVERAGE`: Choose leverage tier (e.g. 5x).
+- `MAX_POSITIONS`: Maximum simultaneous open positions.
+- `FUTURES_TAKE_PROFIT_PCT`: Customize target TP percentage (e.g., 10%).
+
+### 5. Running the Bot
+For local testing:
 ```bash
 python main.py
+```
+
+To run in background mode on a production VPS using PM2:
+```bash
+pm2 start main.py --name bot_crypto --interpreter python3
 ```
 
 ---
@@ -78,11 +91,12 @@ python main.py
 ## ⚙️ Strategy Parameters (`config.py`)
 | Parameter | Default | Description |
 |---|---|---|
-| `ML_CONFIDENCE_THRESHOLD` | `0.65` | Min AI confidence to allow a BUY |
+| `ML_CONFIDENCE_THRESHOLD` | `0.65` | Min AI confidence to allow a trade entry |
 | `TRAILING_STOP_ENABLED` | `True` | Protect profits dynamically |
 | `BREAK_EVEN_ENABLED` | `True` | Move SL to entry after +0.3% |
-| `TOP_PAIRS_COUNT` | `20` | Number of high-volume pairs to scan |
-| `OPTIMIZER_INTERVAL_HOURS`| `1` | How often the AI retrains itself |
+| `TRADE_FUTURES` | `True` | Enable USDⓈ-M Futures mode |
+| `LEVERAGE` | `5` | Leverage multiplier for futures trades |
+| `FUTURES_TAKE_PROFIT_PCT`| `0.10` | 10% Take Profit for futures |
 
 ---
 
