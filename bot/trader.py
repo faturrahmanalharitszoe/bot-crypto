@@ -58,7 +58,7 @@ class Trader:
         self.cooldown_minutes: int = 5  # 5 min cooldown per pair (scalping-friendly)
         
         # Multi-position: max concurrent open positions
-        self.max_positions: int = 3
+        self.max_positions: int = 2
         
         # Position History Logging
         self.history_log_path = "logs/position_history.csv"
@@ -156,17 +156,49 @@ class Trader:
             logger.warning(f"Could not fetch price for {pos.symbol}. Skipping tick.")
             return
 
-        # Get latest signal for EMA-reversal detection (Spot or Futures)
-        df = self.exchange.get_klines(pos.symbol)
-        df = self.strategy.calculate(df)
-        signal, _ = self.strategy.get_signal(df)
-
-        # Check exit conditions (reversal logic)
         reversal_signal = False
-        if pos.side == "BUY":
-            reversal_signal = (signal == "SELL") # Long reversal
-        else:
-            reversal_signal = (signal == "BUY")  # Short reversal
+
+        # 1. Machine Learning Exit (if enabled and model is loaded)
+        if config.ML_ENABLED and config.ML_EXIT_ENABLED and self.ml_predictor.is_ready:
+            try:
+                # Fetch MTF data
+                df_5m = self.exchange.get_klines(pos.symbol, interval="5m")
+                df_1m = self.exchange.get_klines(pos.symbol, interval="1m")
+                df_15m = self.exchange.get_klines(pos.symbol, interval="15m")
+
+                if not df_5m.empty:
+                    ml_class, ml_conf = self.ml_predictor.predict(df_5m, df_1m, df_15m)
+
+                    if pos.side == "BUY": # Long Position
+                        if config.ML_REVERSAL_EXIT_ACTIVE and ml_class == 2: # Short prediction
+                            reversal_signal = "ML_REVERSAL"
+                            logger.info(f"🔮 AI EXIT | {pos.symbol} LONG -> SHORT prediction (Conf: {ml_conf:.2f}) → EXITING")
+                        elif config.ML_EXHAUSTION_EXIT_ACTIVE and ml_class == 0 and ml_conf >= config.ML_CONFIDENCE_THRESHOLD:
+                            reversal_signal = "ML_EXHAUSTION"
+                            logger.info(f"🔮 AI EXIT | {pos.symbol} LONG -> HOLD prediction (Conf: {ml_conf:.2f}) → MOMENTUM EXHAUSTED")
+                    else: # Short Position
+                        if config.ML_REVERSAL_EXIT_ACTIVE and ml_class == 1: # Long prediction
+                            reversal_signal = "ML_REVERSAL"
+                            logger.info(f"🔮 AI EXIT | {pos.symbol} SHORT -> LONG prediction (Conf: {ml_conf:.2f}) → EXITING")
+                        elif config.ML_EXHAUSTION_EXIT_ACTIVE and ml_class == 0 and ml_conf >= config.ML_CONFIDENCE_THRESHOLD:
+                            reversal_signal = "ML_EXHAUSTION"
+                            logger.info(f"🔮 AI EXIT | {pos.symbol} SHORT -> HOLD prediction (Conf: {ml_conf:.2f}) → MOMENTUM EXHAUSTED")
+            except Exception as e:
+                logger.error(f"Failed to check ML exit for {pos.symbol}: {e}")
+
+        # 2. Traditional technical signal exit (fallback or overlay)
+        # We only check this if ML exit hasn't triggered AND config allows it
+        if not reversal_signal and config.TECH_REVERSAL_EXIT_ENABLED:
+            df = self.exchange.get_klines(pos.symbol)
+            df = self.strategy.calculate(df)
+            signal, _ = self.strategy.get_signal(df)
+
+            if pos.side == "BUY":
+                if signal == "SELL":
+                    reversal_signal = "REVERSAL_SIGNAL"
+            else:
+                if signal == "BUY":
+                    reversal_signal = "REVERSAL_SIGNAL"
 
         exit_reason = self.risk_manager.check_exit(pos.symbol, current_price, reversal_signal)
 

@@ -34,7 +34,8 @@ class Position:
         quantity: float,
         take_profit: float,
         stop_loss: float,
-        side: str = "BUY" # BUY for Long, SELL for Short
+        side: str = "BUY", # BUY for Long, SELL for Short
+        is_futures: bool = False
     ) -> None:
         self.symbol      = symbol
         self.entry_price = entry_price
@@ -42,6 +43,7 @@ class Position:
         self.take_profit = take_profit
         self.stop_loss   = stop_loss
         self.side        = side
+        self.is_futures  = is_futures
         self.opened_at   = datetime.utcnow()
         self.candles_held: int = 0
         
@@ -62,7 +64,8 @@ class Position:
             "opened_at":   self.opened_at.isoformat(),
             "peak_price":   self.peak_price,
             "trailing_active": self.trailing_active,
-            "be_active":   self.be_active
+            "be_active":   self.be_active,
+            "is_futures":  self.is_futures
         }
 
     @classmethod
@@ -74,7 +77,8 @@ class Position:
             quantity=data["quantity"],
             take_profit=data["take_profit"],
             stop_loss=data["stop_loss"],
-            side=data.get("side", "BUY")
+            side=data.get("side", "BUY"),
+            is_futures=data.get("is_futures", False)
         )
         pos.opened_at = datetime.fromisoformat(data["opened_at"])
         pos.peak_price = data.get("peak_price", data.get("max_price", pos.entry_price))
@@ -229,7 +233,8 @@ class RiskManager:
             quantity=quantity,
             take_profit=take_profit,
             stop_loss=stop_loss,
-            side=side
+            side=side,
+            is_futures=is_futures
         )
         self.positions[symbol] = pos
         self._save_state()
@@ -309,7 +314,7 @@ class RiskManager:
 
     # ── Exit Conditions ───────────────────────────────────────
 
-    def check_exit(self, symbol: str, current_price: float, reversal_signal: bool) -> Optional[str]:
+    def check_exit(self, symbol: str, current_price: float, reversal_signal: bool | str) -> Optional[str]:
         """
         Check whether an open position should be closed.
         Returns the exit reason string, or None.
@@ -330,9 +335,25 @@ class RiskManager:
 
         pnl_pct = pos.unrealized_pnl_pct(current_price)
 
+        # Determine settings based on Spot vs Futures
+        if getattr(pos, "is_futures", False):
+            ts_enabled = config.FUTURES_TRAILING_STOP_ENABLED if hasattr(config, "FUTURES_TRAILING_STOP_ENABLED") else config.TRAILING_STOP_ENABLED
+            ts_activation = config.FUTURES_TRAILING_STOP_ACTIVATION_PCT if hasattr(config, "FUTURES_TRAILING_STOP_ACTIVATION_PCT") else config.TRAILING_STOP_ACTIVATION_PCT
+            ts_callback = config.FUTURES_TRAILING_STOP_CALLBACK_PCT if hasattr(config, "FUTURES_TRAILING_STOP_CALLBACK_PCT") else config.TRAILING_STOP_CALLBACK_PCT
+            
+            be_enabled = config.FUTURES_BREAK_EVEN_ENABLED if hasattr(config, "FUTURES_BREAK_EVEN_ENABLED") else config.BREAK_EVEN_ENABLED
+            be_activation = config.FUTURES_BREAK_EVEN_ACTIVATION_PCT if hasattr(config, "FUTURES_BREAK_EVEN_ACTIVATION_PCT") else config.BREAK_EVEN_ACTIVATION_PCT
+        else:
+            ts_enabled = config.TRAILING_STOP_ENABLED
+            ts_activation = config.TRAILING_STOP_ACTIVATION_PCT
+            ts_callback = config.TRAILING_STOP_CALLBACK_PCT
+            
+            be_enabled = config.BREAK_EVEN_ENABLED
+            be_activation = config.BREAK_EVEN_ACTIVATION_PCT
+
         # 1. Break-Even Check
-        if config.BREAK_EVEN_ENABLED and not pos.be_active:
-            if pnl_pct >= (config.BREAK_EVEN_ACTIVATION_PCT * 100):
+        if be_enabled and not pos.be_active:
+            if pnl_pct >= (be_activation * 100):
                 pos.be_active = True
                 # Move SL to entry
                 if is_long:
@@ -345,18 +366,18 @@ class RiskManager:
                         logger.info(f"🛡️  BREAK-EVEN (SHORT) | {pos.symbol} SL -> {pos.entry_price:.6f}")
 
         # 2. Trailing Stop Check
-        if config.TRAILING_STOP_ENABLED:
-            if not pos.trailing_active and pnl_pct >= (config.TRAILING_STOP_ACTIVATION_PCT * 100):
+        if ts_enabled:
+            if not pos.trailing_active and pnl_pct >= (ts_activation * 100):
                 pos.trailing_active = True
                 logger.info(f"🛡️  TRAILING STOP ACTIVATED for {pos.symbol} at {current_price:.6f}")
 
             if pos.trailing_active:
                 if is_long:
-                    new_sl = pos.peak_price * (1 - config.TRAILING_STOP_CALLBACK_PCT)
+                    new_sl = pos.peak_price * (1 - ts_callback)
                     if new_sl > pos.stop_loss:
                         pos.stop_loss = new_sl
                 else: # Short
-                    new_sl = pos.peak_price * (1 + config.TRAILING_STOP_CALLBACK_PCT)
+                    new_sl = pos.peak_price * (1 + ts_callback)
                     if new_sl < pos.stop_loss:
                         pos.stop_loss = new_sl
 
@@ -380,8 +401,10 @@ class RiskManager:
             if current_price >= pos.stop_loss:
                 return "STOP_LOSS"
 
-        # ── Reversal (strategy signal) ────────────────────
+        # ── Reversal (strategy / ML signal) ────────────────
         if reversal_signal:
+            if isinstance(reversal_signal, str):
+                return reversal_signal
             return "REVERSAL_SIGNAL"
 
         # ── Max hold time ─────────────────────────────────

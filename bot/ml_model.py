@@ -127,28 +127,29 @@ class MLPredictor:
             df['dist_ema_fast'] = (df['close'] - df['ema_9']) / (df['ema_9'] + 1e-9) * 100
             df['dist_ema_slow'] = (df['close'] - df['ema_21']) / (df['ema_21'] + 1e-9) * 100
 
-            # ── 1m Features (Execution) ──────────────────────
+            # ── 1m & 15m Sync (Matches train_model.py exactly) ────────────────
             if df_1m is not None and not df_1m.empty:
-                rsi_1m = calc_rsi(df_1m['close']).iloc[-1]
-                vol_1m_mean = df_1m['volume'].rolling(20).mean().iloc[-1]
-                vol_1m_spike = df_1m['volume'].iloc[-1] / (vol_1m_mean + 1e-9)
+                df_1m_feat = pd.DataFrame(index=df.index)
+                df_1m_feat['rsi_1m'] = calc_rsi(df_1m['close']).reindex(df.index, method='ffill')
+                vol_1m_mean = df_1m['volume'].rolling(20).mean()
+                df_1m_feat['vol_1m_spike'] = (df_1m['volume'] / (vol_1m_mean + 1e-9)).reindex(df.index, method='ffill')
             else:
-                rsi_1m, vol_1m_spike = 50.0, 1.0
-            
-            df['rsi_1m'] = rsi_1m
-            df['vol_1m_spike'] = vol_1m_spike
+                df_1m_feat = pd.DataFrame(index=df.index)
+                df_1m_feat['rsi_1m'] = 50.0
+                df_1m_feat['vol_1m_spike'] = 1.0
 
-            # ── 15m Features (Context) ───────────────────────
             if df_15m is not None and not df_15m.empty:
-                rsi_15m = calc_rsi(df_15m['close']).iloc[-1]
-                ema_15m_fast = df_15m['close'].ewm(span=9).mean().iloc[-1]
-                ema_15m_slow = df_15m['close'].ewm(span=21).mean().iloc[-1]
-                trend_15m = 1 if ema_15m_fast > ema_15m_slow else -1
+                df_15m_feat = pd.DataFrame(index=df.index)
+                df_15m_feat['rsi_15m'] = calc_rsi(df_15m['close']).reindex(df.index, method='ffill')
+                ema_15m_f = df_15m['close'].ewm(span=9).mean()
+                ema_15m_s = df_15m['close'].ewm(span=21).mean()
+                df_15m_feat['trend_15m'] = (ema_15m_f > ema_15m_s).astype(int).replace(0, -1).reindex(df.index, method='ffill')
             else:
-                rsi_15m, trend_15m = 50.0, 0
-                
-            df['rsi_15m'] = rsi_15m
-            df['trend_15m'] = trend_15m
+                df_15m_feat = pd.DataFrame(index=df.index)
+                df_15m_feat['rsi_15m'] = 50.0
+                df_15m_feat['trend_15m'] = 0
+
+            df = pd.concat([df, df_1m_feat, df_15m_feat], axis=1)
 
             # Additional features to match train_model.py
             df['rsi_div'] = df['rsi'].diff() - df['close'].diff() / df['close']
@@ -156,7 +157,12 @@ class MLPredictor:
             df['day_of_week'] = df.index.dayofweek
             df['range_pct'] = (df['high'] - df['low']) / df['close'] * 100
             
-            return df[FEATURE_COLS].dropna().iloc[[-1]]
+            valid_df = df[FEATURE_COLS].dropna()
+            if len(valid_df) < 2:
+                # Fallback to last row if history is very short
+                return valid_df.iloc[[-1]] if not valid_df.empty else None
+            # Return the last fully completed candle (index -2) to avoid unclosed live candle noise
+            return valid_df.iloc[[-2]]
             
         except Exception as e:
             logger.error(f"Error preparing MTF features: {e}")

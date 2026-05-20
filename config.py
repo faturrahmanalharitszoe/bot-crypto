@@ -17,7 +17,9 @@ TESTNET: bool = os.getenv("TESTNET", "true").lower() == "true"
 
 # ── Futures Settings ──────────────────────────────────────
 FUTURES_ENABLED: bool = True       # ⚠️ ENABLE FUTURES (USDT-M)
-FUTURES_LEVERAGE: int = 5          # Default leverage (1x to 20x recommended)
+#FUTURES_LEVERAGE: int = 10          # Default leverage (1x to 20x recommended)
+
+FUTURES_LEVERAGE: int = 5
 FUTURES_MARGIN_TYPE: str = "ISOLATED" # ISOLATED or CROSS
 
 # ════════════════════════════════════════════════════════════
@@ -40,26 +42,37 @@ VOLUME_AVG_PERIOD: int = 20       # Rolling window for volume average
 # ════════════════════════════════════════════════════════════
 #  Risk Management
 # ════════════════════════════════════════════════════════════
-MAX_POSITION_PCT: float = 0.40    # Use at most 40% of available USDT per trade
+#MAX_POSITION_PCT: float = 2.00    # Use at most 40% of available USDT per trade
+
+MAX_POSITION_PCT: float = 0.40
 
 # ── Spot TP / SL ─────────────────────────────────────────────
-TAKE_PROFIT_PCT: float = 0.015    # Spot: Close trade at +1.5% profit
+TAKE_PROFIT_PCT: float = 0.015   # Spot: Close trade at +1.5% profit
 STOP_LOSS_PCT: float = 0.008      # Spot: Close trade at -0.8% loss
 
 # ── Futures TP / SL (higher because price swings are larger on perp) ─
-FUTURES_TAKE_PROFIT_PCT: float = 0.10   # Futures: Close at +10% price move
-FUTURES_STOP_LOSS_PCT: float = 0.05     # Futures: Close at -5% price move (2:1 R:R)
+FUTURES_TAKE_PROFIT_PCT: float = 0.020   # Futures: Close at +2.0% price move (10% profit @ 5x leverage)
+FUTURES_STOP_LOSS_PCT: float = 0.008     # Futures: Close at -0.8% price move (4% loss @ 5x leverage)
 
 MAX_HOLD_CANDLES: int = 48        # Force-exit after 48 candles (~4 hrs on 5m)
 
-# ── Trailing Stop Settings ───────────────────────────────────
+# ── Spot Trailing Stop Settings ──────────────────────────────
 TRAILING_STOP_ENABLED: bool = True
-TRAILING_STOP_ACTIVATION_PCT: float = 0.006  # Activate after +0.6% profit
-TRAILING_STOP_CALLBACK_PCT: float = 0.003    # Trail by 0.3% from the peak
+TRAILING_STOP_ACTIVATION_PCT: float = 0.006  # Spot: Activate after +0.6% profit
+TRAILING_STOP_CALLBACK_PCT: float = 0.003    # Spot: Trail by 0.3% from the peak
 
-# ── Break-Even Settings ──────────────────────────────────────
+# ── Futures Trailing Stop Settings ───────────────────────────
+FUTURES_TRAILING_STOP_ENABLED: bool = True
+FUTURES_TRAILING_STOP_ACTIVATION_PCT: float = 0.008  # Futures: Activate after +0.8% price move (8% profit @ 10x leverage)
+FUTURES_TRAILING_STOP_CALLBACK_PCT: float = 0.004    # Futures: Trail by 0.4% from the peak
+
+# ── Spot Break-Even Settings ─────────────────────────────────
 BREAK_EVEN_ENABLED: bool = True
-BREAK_EVEN_ACTIVATION_PCT: float = 0.003     # Move SL to entry after +0.3%
+BREAK_EVEN_ACTIVATION_PCT: float = 0.003     # Spot: Move SL to entry after +0.3%
+
+# ── Futures Break-Even Settings ──────────────────────────────
+FUTURES_BREAK_EVEN_ENABLED: bool = True
+FUTURES_BREAK_EVEN_ACTIVATION_PCT: float = 0.005     # Futures: Move SL to entry after +0.5% price move
 
 # ════════════════════════════════════════════════════════════
 #  Pair Selection
@@ -98,9 +111,15 @@ WEB_PORT: int = int(os.getenv("WEB_PORT", "5050"))
 # ════════════════════════════════════════════════════════════
 ML_ENABLED: bool = os.getenv("ML_ENABLED", "true").lower() == "true"
 ML_MODEL_PATH: str = "models/rf_model.pkl"       # Path to trained RandomForest model
-ML_CONFIDENCE_THRESHOLD: float = float(os.getenv("ML_CONFIDENCE_THRESHOLD", "0.52"))
+ML_CONFIDENCE_THRESHOLD: float = float(os.getenv("ML_CONFIDENCE_THRESHOLD", "0.65"))
 # In Full AI Mode: ML is the primary trigger, EMA/RSI is the confirmation filter
 ML_FULL_AI_MODE: bool = True
+
+# ── ML Exit Settings ─────────────────────────────────────────
+ML_EXIT_ENABLED: bool = True               # Enable ML-based exit decisions
+ML_REVERSAL_EXIT_ACTIVE: bool = True       # Exit if ML predicts opposite trend (LONG -> SHORT, SHORT -> LONG)
+ML_EXHAUSTION_EXIT_ACTIVE: bool = False    # Exit if ML predicts HOLD (momentum exhausted)
+TECH_REVERSAL_EXIT_ENABLED: bool = False   # If False, traditional EMA crossover reversal exits are disabled
 
 # ════════════════════════════════════════════════════════════
 #  Sentiment Analysis (Fear & Greed Index — No API Key needed)
