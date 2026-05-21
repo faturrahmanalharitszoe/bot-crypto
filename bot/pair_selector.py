@@ -42,6 +42,13 @@ def select_best_pairs(exchange) -> List[str]:
         logger.warning("No ticker data returned — using fallback pair list.")
         return _TESTNET_FALLBACK[:config.TOP_PAIRS_COUNT]
 
+    # Get all active trading symbols to filter out delisted/suspended pairs early
+    try:
+        active_symbols = exchange.get_active_symbols()
+    except Exception as e:
+        logger.warning(f"Could not fetch active symbols: {e}. Skipping status filtering.")
+        active_symbols = None
+
     candidates = []
 
     for t in tickers:
@@ -49,6 +56,10 @@ def select_best_pairs(exchange) -> List[str]:
 
         # ── Only USDT pairs ───────────────────────────────
         if not symbol.endswith("USDT"):
+            continue
+
+        # ── Skip non-TRADING symbols ──────────────────────
+        if active_symbols is not None and symbol not in active_symbols:
             continue
 
         # ── Exclude leveraged/stable tokens ──────────────

@@ -193,12 +193,23 @@ class Exchange:
         """Return the latest price for a symbol (Hybrid)."""
         try:
             use_f = config.FUTURES_ENABLED and self.is_futures(symbol)
+            ticker = None
             if use_f:
-                ticker = self.client.futures_symbol_ticker(symbol=symbol)
-            else:
+                try:
+                    ticker = self.client.futures_symbol_ticker(symbol=symbol)
+                except Exception as e:
+                    logger.warning(f"Futures price fetch failed for {symbol}: {e}. Trying Spot fallback.")
+            
+            # Fallback to Spot ticker if Futures was not fetched or returned empty/invalid response
+            if not ticker or not isinstance(ticker, dict) or "price" not in ticker:
                 ticker = self.client.get_symbol_ticker(symbol=symbol)
+            
+            if not isinstance(ticker, dict) or "price" not in ticker:
+                logger.error(f"Failed to fetch price for {symbol}: ticker response invalid or missing 'price': {ticker}")
+                return 0.0
+                
             return float(ticker["price"])
-        except BinanceAPIException as e:
+        except Exception as e:
             logger.error(f"Failed to fetch price for {symbol}: {e}")
             return 0.0
 
@@ -215,6 +226,28 @@ class Exchange:
         """Check if a symbol is available on the Futures market."""
         return symbol in self.futures_symbols
 
+    def get_active_symbols(self) -> set:
+        """Return a set of all symbols that are currently in TRADING status on Spot and/or Futures."""
+        active = set()
+        try:
+            spot_info = self.client.get_exchange_info()
+            for s in spot_info.get('symbols', []):
+                if s.get('status') == 'TRADING':
+                    active.add(s['symbol'])
+        except Exception as e:
+            logger.warning(f"Failed to fetch active Spot symbols: {e}")
+
+        try:
+            if config.FUTURES_ENABLED:
+                futures_info = self.client.futures_exchange_info()
+                for s in futures_info.get('symbols', []):
+                    if s.get('status') == 'TRADING':
+                        active.add(s['symbol'])
+        except Exception as e:
+            logger.warning(f"Failed to fetch active Futures symbols: {e}")
+            
+        return active
+
     # ── Symbol Info ──────────────────────────────────────────
 
     def get_symbol_info(self, symbol: str) -> Optional[dict]:
@@ -227,12 +260,24 @@ class Exchange:
         try:
             use_f = config.FUTURES_ENABLED and self.is_futures(symbol)
             if use_f:
-                exchange_info = self.client.futures_exchange_info()
+                try:
+                    exchange_info = self.client.futures_exchange_info(symbol=symbol)
+                except Exception:
+                    exchange_info = self.client.futures_exchange_info()
             else:
-                exchange_info = self.client.get_exchange_info()
+                try:
+                    exchange_info = self.client.get_exchange_info(symbol=symbol)
+                except Exception:
+                    exchange_info = self.client.get_exchange_info()
                 
             info = next((s for s in exchange_info['symbols'] if s['symbol'] == symbol), None)
             if not info:
+                self._symbol_info_cache[symbol] = None
+                return None
+
+            if info.get("status", "TRADING") != "TRADING":
+                logger.warning(f"⚠️  Symbol {symbol} is not in TRADING status (current status: {info.get('status')}). Skipping.")
+                self._symbol_info_cache[symbol] = None
                 return None
 
             parsed = {
@@ -248,7 +293,7 @@ class Exchange:
                     parsed["step_size"] = float(f["stepSize"])
                     parsed["min_qty"]   = float(f["minQty"])
                     step = float(f["stepSize"])
-                    if step < 1:
+                    if 0 < step < 1:
                         parsed["base_precision"] = int(round(-math.log10(step)))
                     else:
                         parsed["base_precision"] = 0
@@ -320,16 +365,31 @@ class Exchange:
             return None
 
     def get_filled_price(self, order: dict) -> float:
-        """Extract average fill price from an order dict."""
+        """Extract average fill price from an order dict (supports both Spot and Futures)."""
+        if not order or not isinstance(order, dict):
+            return 0.0
         try:
+            # 1. Direct average price (Futures)
+            if "avgPrice" in order and float(order["avgPrice"]) > 0:
+                return float(order["avgPrice"])
+
+            # 2. Fills list (Spot)
             fills = order.get("fills", [])
             if fills:
                 total_cost = sum(float(f["price"]) * float(f["qty"]) for f in fills)
                 total_qty  = sum(float(f["qty"]) for f in fills)
                 return total_cost / total_qty if total_qty > 0 else 0.0
-            # Fallback: cummulative quote qty / executed qty
-            exec_qty  = float(order.get("executedQty", 0))
-            cum_quote = float(order.get("cummulativeQuoteQty", 0))
-            return cum_quote / exec_qty if exec_qty > 0 else 0.0
-        except (ValueError, ZeroDivisionError):
+
+            # 3. Cumulative quote qty / executed qty (Spot fallback or Futures)
+            exec_qty = float(order.get("executedQty", order.get("cumQty", 0)))
+            if exec_qty > 0:
+                cum_quote = float(order.get("cummulativeQuoteQty", order.get("cumQuote", 0)))
+                return cum_quote / exec_qty
+            
+            # 4. Standard price field as last fallback
+            if "price" in order and float(order["price"]) > 0:
+                return float(order["price"])
+                
+            return 0.0
+        except (ValueError, ZeroDivisionError, KeyError, TypeError):
             return 0.0

@@ -183,7 +183,9 @@ def main() -> None:
             logger.info(f"   Continuing in {config.LOOP_INTERVAL_SECONDS}s...")
 
         if _running:
-            time.sleep(config.LOOP_INTERVAL_SECONDS)
+            # Dynamic sleep: monitor open positions fast, check watchlist normally
+            sleep_time = getattr(config, "LOOP_INTERVAL_FAST", 5) if trader.risk_manager.has_positions else config.LOOP_INTERVAL_SECONDS
+            time.sleep(sleep_time)
 
     # ── Shutdown ──────────────────────────────────────────
     notifier.notify_stop()

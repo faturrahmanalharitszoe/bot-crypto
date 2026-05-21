@@ -8,6 +8,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Enable programmatic DNS bypass for regions where Binance is blocked
+from bot import dns_bypass
+
 # ════════════════════════════════════════════════════════════
 #  Binance API Credentials
 # ════════════════════════════════════════════════════════════
@@ -19,13 +22,15 @@ TESTNET: bool = os.getenv("TESTNET", "true").lower() == "true"
 FUTURES_ENABLED: bool = True       # ⚠️ ENABLE FUTURES (USDT-M)
 #FUTURES_LEVERAGE: int = 10          # Default leverage (1x to 20x recommended)
 
-FUTURES_LEVERAGE: int = 5
+FUTURES_LEVERAGE: int = 10
 FUTURES_MARGIN_TYPE: str = "ISOLATED" # ISOLATED or CROSS
 
 # ════════════════════════════════════════════════════════════
 #  Candle / Timeframe Settings
 # ════════════════════════════════════════════════════════════
-CANDLE_INTERVAL: str = "5m"       # 5-minute candles for scalping
+CANDLE_INTERVAL: str = "15m"      # Main candle interval for day trading
+LOWER_INTERVAL: str = "5m"        # Lower interval for trigger confirmation
+HIGHER_INTERVAL: str = "1h"       # Higher interval for trend bias confirmation
 CANDLE_LIMIT: int = 150           # Historical candles to fetch per request
 
 # ════════════════════════════════════════════════════════════
@@ -42,9 +47,9 @@ VOLUME_AVG_PERIOD: int = 20       # Rolling window for volume average
 # ════════════════════════════════════════════════════════════
 #  Risk Management
 # ════════════════════════════════════════════════════════════
-#MAX_POSITION_PCT: float = 2.00    # Use at most 40% of available USDT per trade
+MAX_POSITION_PCT: float = 4.00    # Use at most 40% of available USDT per trade
 
-MAX_POSITION_PCT: float = 0.40
+#MAX_POSITION_PCT: float = 0.40
 
 # ── Spot TP / SL ─────────────────────────────────────────────
 TAKE_PROFIT_PCT: float = 0.015   # Spot: Close trade at +1.5% profit
@@ -92,7 +97,8 @@ EXCLUDE_KEYWORDS: list = [
 # ════════════════════════════════════════════════════════════
 #  Bot Loop
 # ════════════════════════════════════════════════════════════
-LOOP_INTERVAL_SECONDS: int = 60   # Sleep between each main loop iteration
+LOOP_INTERVAL_SECONDS: int = 30   # Sleep between each main loop iteration when scanning only
+LOOP_INTERVAL_FAST: int = 5       # Sleep between each main loop iteration when holding positions (faster TP/SL check)
 
 # ════════════════════════════════════════════════════════════
 #  Telegram Notifications (optional)
@@ -107,12 +113,14 @@ WEB_DASHBOARD_ENABLED: bool = os.getenv("WEB_DASHBOARD", "true").lower() == "tru
 WEB_PORT: int = int(os.getenv("WEB_PORT", "5050"))
 
 # ════════════════════════════════════════════════════════════
-#  Machine Learning (Full AI Mode)
+#  Machine Learning (Strategy Signal Confirmation Mode)
 # ════════════════════════════════════════════════════════════
 ML_ENABLED: bool = os.getenv("ML_ENABLED", "true").lower() == "true"
-ML_MODEL_PATH: str = "models/rf_model.pkl"       # Path to trained RandomForest model
-ML_CONFIDENCE_THRESHOLD: float = float(os.getenv("ML_CONFIDENCE_THRESHOLD", "0.65"))
-# In Full AI Mode: ML is the primary trigger, EMA/RSI is the confirmation filter
+ML_MODEL_PATH: str = "models/dl_model.pth"       # Path to trained Deep Learning model
+ML_SCALER_PATH: str = "models/scaler.pkl"        # Path to fitted feature scaler
+ML_CONFIDENCE_THRESHOLD: float = float(os.getenv("ML_CONFIDENCE_THRESHOLD", "0.55"))
+# In Confirmation Mode, strategy (EMA/RSI) acts as primary trigger, and ML confirms direction.
+# Since HOLD (0) is filtered from training, ML does not discover new trades.
 ML_FULL_AI_MODE: bool = True
 
 # ── ML Exit Settings ─────────────────────────────────────────

@@ -421,12 +421,50 @@ function renderPositions(positions){
 function renderWatchlist(wl){
   const el=document.getElementById('watchlist');
   if(!wl||!wl.length){el.innerHTML='<div style="color:var(--muted);font-size:13px;padding:20px 0;text-align:center">No data</div>';return;}
+  const threshold = window.mlThreshold || 0.65;
   el.innerHTML=wl.map(p=>{
-    const mc=p.ml_class||0, conf=p.ml_confidence||0, rsi=p.rsi||50;
-    let bias='<span class="bias-hold">HOLD ◆</span>';
+    const ts=p.tech_signal||'HOLD', mc=p.ml_class||0, conf=p.ml_confidence||0, rsi=p.rsi||50;
+    
+    // Tech signal styling
+    let techHtml='<span class="bias-hold" style="font-weight:600">HOLD ⚪</span>';
+    if(ts==='BUY') techHtml='<span class="bias-long" style="font-weight:600">BUY 🟢</span>';
+    if(ts==='SELL') techHtml='<span class="bias-short" style="font-weight:600">SELL 🔴</span>';
+    
+    // AI Confirmation styling
+    let aiHtml='<span style="color:var(--muted);font-size:11px">HOLD ⚪</span>';
     let barClr='var(--muted)';
-    if(mc===1){bias='<span class="bias-long">LONG ▲</span>';barClr='var(--green)';}
-    if(mc===2){bias='<span class="bias-short">SHORT ▼</span>';barClr='var(--red)';}
+    
+    if(p.status_text){
+      if(p.status_text.includes('READY')){
+        aiHtml='<span style="color:var(--green);font-size:11px;font-weight:700">CONFIRMED ✅</span>';
+        barClr='var(--green)';
+      }else if(p.status_text.includes('BLOCKED')){
+        const reason=p.status_text.split('(')[1]?p.status_text.split('(')[1].replace(')',''):'Blocked';
+        aiHtml=`<span style="color:var(--red);font-size:11px;font-weight:700">BLOCKED ❌</span><div style="font-size:9px;color:var(--muted);line-height:1.1;margin-top:2px">${reason}</div>`;
+        barClr='var(--red)';
+      }else if(p.status_text.includes('COOLDOWN')){
+        const timeVal=p.status_text.split('(')[1]?p.status_text.split('(')[1].replace(')',''):'—';
+        aiHtml=`<span style="color:var(--muted);font-size:11px;font-weight:700">COOLDOWN ⏳</span><div style="font-size:9px;color:var(--muted);line-height:1.1;margin-top:2px">${timeVal}</div>`;
+        barClr='var(--muted)';
+      }
+    }else{
+      if(ts==='BUY'){
+        const ok = (mc===1 && conf>=threshold);
+        aiHtml = ok ? '<span style="color:var(--green);font-size:11px;font-weight:700">CONFIRMED ✅</span>'
+                    : '<span style="color:var(--red);font-size:11px;font-weight:700">BLOCKED ❌</span>';
+        barClr = ok ? 'var(--green)' : 'var(--red)';
+      } else if(ts==='SELL'){
+        const ok = (mc===2 && conf>=threshold);
+        aiHtml = ok ? '<span style="color:var(--green);font-size:11px;font-weight:700">CONFIRMED ✅</span>'
+                    : '<span style="color:var(--red);font-size:11px;font-weight:700">BLOCKED ❌</span>';
+        barClr = ok ? 'var(--green)' : 'var(--red)';
+      }
+    }
+    
+    let mlDir = 'HOLD';
+    if(mc===1) mlDir = 'LONG';
+    if(mc===2) mlDir = 'SHORT';
+    
     const mBadge=p.is_futures?'<span class="mbadge mf">F</span>':'<span class="mbadge ms">S</span>';
     const rsiCls=rsi>70?'red':(rsi<30?'green':'');
     const confPct=Math.round(conf*100);
@@ -435,9 +473,12 @@ function renderWatchlist(wl){
         ${mBadge}
         <span class="wl-sym">${p.symbol}</span>
         <div class="conf-bar" style="width:${confPct}%;background:${barClr};max-width:60px"></div>
-        <div class="wl-sub">AI: ${confPct}%</div>
+        <div class="wl-sub">AI: ${mlDir} ${confPct}%</div>
       </div>
-      <div style="padding-left:4px">${bias}</div>
+      <div style="padding-left:4px;display:flex;flex-direction:column;gap:2px">
+        <div>${techHtml}</div>
+        <div>${aiHtml}</div>
+      </div>
       <div class="wl-rsi ${rsiCls}">${rsi.toFixed(1)}<div style="font-size:9px;color:var(--muted)">RSI</div></div>
     </div>`;
   }).join('');
@@ -472,8 +513,10 @@ async function refreshStatus(){
       lEl.style.color=score<-0.5?'var(--red)':(score<0?'var(--yellow)':(score>0.5?'var(--green)':'var(--cyan)'));
       document.getElementById('sg-thumb').style.left=(fv)+'%';
     }
-    if(d.ml_confidence_threshold!=null)
+    if(d.ml_confidence_threshold!=null) {
+      window.mlThreshold = parseFloat(d.ml_confidence_threshold);
       document.getElementById('opt-thr').textContent=(d.ml_confidence_threshold*100).toFixed(0)+'%';
+    }
 
     // Watchlist
     renderWatchlist(d.watchlist||[]);

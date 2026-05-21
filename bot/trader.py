@@ -64,6 +64,9 @@ class Trader:
         self.history_log_path = "logs/position_history.csv"
         self._ensure_history_log()
         
+        # Rate-limiting scanner loop
+        self.last_scan_time = 0.0
+        
         self._refresh_watchlist()
 
     # ── Watchlist Management ─────────────────────────────────
@@ -162,12 +165,12 @@ class Trader:
         if config.ML_ENABLED and config.ML_EXIT_ENABLED and self.ml_predictor.is_ready:
             try:
                 # Fetch MTF data
-                df_5m = self.exchange.get_klines(pos.symbol, interval="5m")
-                df_1m = self.exchange.get_klines(pos.symbol, interval="1m")
-                df_15m = self.exchange.get_klines(pos.symbol, interval="15m")
+                df_main = self.exchange.get_klines(pos.symbol, interval=config.CANDLE_INTERVAL)
+                df_lower = self.exchange.get_klines(pos.symbol, interval=config.LOWER_INTERVAL)
+                df_higher = self.exchange.get_klines(pos.symbol, interval=config.HIGHER_INTERVAL)
 
-                if not df_5m.empty:
-                    ml_class, ml_conf = self.ml_predictor.predict(df_5m, df_1m, df_15m)
+                if not df_main.empty:
+                    ml_class, ml_conf = self.ml_predictor.predict(df_main, df_lower, df_higher)
 
                     if pos.side == "BUY": # Long Position
                         if config.ML_REVERSAL_EXIT_ACTIVE and ml_class == 2: # Short prediction
@@ -327,6 +330,12 @@ class Trader:
 
     def _scan_for_entry(self) -> None:
         """Scan all watchlist pairs for a BUY/SELL signal."""
+        # Rate-limit scanning to prevent API spam (especially when monitoring fast in position mode)
+        now = time.time()
+        if now - self.last_scan_time < config.LOOP_INTERVAL_SECONDS:
+            return
+        self.last_scan_time = now
+
         # NOTE: loop_count is already incremented in tick(), do NOT re-increment here
         usdt_balance = self.exchange.get_usdt_balance()
         if usdt_balance < 1.0:
@@ -335,23 +344,46 @@ class Trader:
 
         # Cache data for this tick to avoid multiple API calls
         tick_data = {}
+        tech_signals = {}
 
         for symbol in self.watchlist:
-            # Fetch all timeframes once
-            df_5m = self.exchange.get_klines(symbol, interval="5m")
-            df_1m = self.exchange.get_klines(symbol, interval="1m")
-            df_15m = self.exchange.get_klines(symbol, interval="15m")
+            # Ensure symbol is active/trading on Binance
+            sym_info = self.exchange.get_symbol_info(symbol)
+            if not sym_info:
+                self._ml_scores[symbol] = (0, 0.0)
+                tick_data[symbol] = (None, None, None)
+                tech_signals[symbol] = "HOLD"
+                continue
+
+            # Fetch main timeframe first
+            df_main = self.exchange.get_klines(symbol, interval=config.CANDLE_INTERVAL)
+            if df_main.empty: continue
             
-            if df_5m.empty: continue
+            # Check technical strategy signal first (still tracked for RSI/dashboard)
+            df_feat = self.strategy.calculate(df_main)
+            tech_signal, _ = self.strategy.get_signal(df_feat)
+            tech_signals[symbol] = tech_signal or "HOLD"
             
-            ml_class, ml_conf = self.ml_predictor.predict(df_5m, df_1m, df_15m)
+            ml_class, ml_conf = 0, 0.0
+            df_lower, df_higher = None, None
+            
+            # Fetch lower and higher timeframes and run predictor in Full AI Mode,
+            # or in Confirmation Mode when tech signal is present.
+            should_predict = (config.ML_ENABLED and config.ML_FULL_AI_MODE) or (tech_signal in ("BUY", "SELL"))
+            
+            if should_predict:
+                df_lower = self.exchange.get_klines(symbol, interval=config.LOWER_INTERVAL)
+                df_higher = self.exchange.get_klines(symbol, interval=config.HIGHER_INTERVAL)
+                if not df_lower.empty and not df_higher.empty:
+                    ml_class, ml_conf = self.ml_predictor.predict(df_main, df_lower, df_higher)
+            
             self._ml_scores[symbol] = (ml_class, ml_conf)
-            tick_data[symbol] = (df_5m, df_1m, df_15m)
+            tick_data[symbol] = (df_main, df_lower, df_higher)
             
         # Print Breakdown Table
         logger.info("📊 WATCHLIST BREAKDOWN:")
-        logger.info(f"  {'Pair':<12} | {'Prediction':<10} | {'Conf':<6} | {'Status'}")
-        logger.info("  " + "─" * 45)
+        logger.info(f"  {'Pair':<16} | {'Tech':<8} | {'ML Pred':<9} | {'Conf':<4} | {'RSI':<10} | {'Status'}")
+        logger.info("  " + "─" * 75)
         
         # Prepare dashboard data
         self.dashboard_watchlist = []
@@ -359,6 +391,13 @@ class Trader:
         for symbol in self.watchlist:
             if symbol not in self._ml_scores: continue
             ml_class, ml_conf = self._ml_scores[symbol]
+            tech_signal = tech_signals.get(symbol, "HOLD")
+            
+            # Formatting signals with emojis
+            tech_text = "HOLD ⚪"
+            if tech_signal == "BUY": tech_text = "BUY 🟢"
+            if tech_signal == "SELL": tech_text = "SELL 🔴"
+
             pred_text = "HOLD ⚪"
             if ml_class == 1: pred_text = "LONG 🟢"
             if ml_class == 2: pred_text = "SHORT 🔴"
@@ -367,18 +406,72 @@ class Trader:
             is_f = self.exchange.is_futures(symbol)
             m_label = "[F]" if is_f else "[S]"
             
-            df_5m, _, _ = tick_data[symbol]
-            df_feat = self.strategy.calculate(df_5m)
-            rsi = df_feat['rsi'].iloc[-1]
+            df_main, _, _ = tick_data[symbol]
+            if df_main is not None and not df_main.empty:
+                df_feat = self.strategy.calculate(df_main)
+                rsi = df_feat['rsi'].iloc[-1]
+            else:
+                rsi = 0.0
             
-            logger.info(f"  {symbol:<12} {m_label} | {pred_text:<10} | {ml_conf:.2f} | RSI: {rsi:.1f}")
+            # Cooldown check
+            last_exit = self.cooldowns.get(symbol, 0)
+            elapsed = (time.time() - last_exit) / 60
+            
+            # Determine status text and block reason
+            sym_info = self.exchange.get_symbol_info(symbol)
+            if elapsed < self.cooldown_minutes:
+                status_text = f"COOLDOWN ({self.cooldown_minutes - elapsed:.1f}m)"
+            elif not sym_info:
+                status_text = "BLOCKED ❌ (Closed)"
+            elif config.ML_ENABLED and config.ML_FULL_AI_MODE:
+                # Full AI Mode status determination
+                if ml_class not in (1, 2):
+                    status_text = "HOLD ⚪"
+                elif ml_conf < config.ML_CONFIDENCE_THRESHOLD:
+                    status_text = f"BLOCKED ❌ (Low Conf)"
+                else:
+                    side = "BUY" if ml_class == 1 else "SELL"
+                    if not is_f and side == "SELL":
+                        status_text = "BLOCKED ❌ (Spot cannot Short)"
+                    elif side == "BUY" and self.sentiment.is_blocked(symbol):
+                        status_text = "BLOCKED ❌ (Sentiment Blocked)"
+                    else:
+                        status_text = "READY ✅"
+            else:
+                # Confirmation / Pure Technical Mode status determination
+                if tech_signal not in ("BUY", "SELL"):
+                    status_text = "HOLD ⚪"
+                else:
+                    if config.ML_ENABLED:
+                        is_confirmed = (tech_signal == "BUY" and ml_class == 1) or (tech_signal == "SELL" and ml_class == 2)
+                        if not is_confirmed:
+                            status_text = f"BLOCKED ❌ (Mismatch)"
+                        elif ml_conf < config.ML_CONFIDENCE_THRESHOLD:
+                            status_text = f"BLOCKED ❌ (Low Conf)"
+                        elif not is_f and tech_signal == "SELL":
+                            status_text = "BLOCKED ❌ (Spot cannot Short)"
+                        elif tech_signal == "BUY" and self.sentiment.is_blocked(symbol):
+                            status_text = "BLOCKED ❌ (Sentiment Blocked)"
+                        else:
+                            status_text = "READY ✅"
+                    else:
+                        if not is_f and tech_signal == "SELL":
+                            status_text = "BLOCKED ❌ (Spot cannot Short)"
+                        elif tech_signal == "BUY" and self.sentiment.is_blocked(symbol):
+                            status_text = "BLOCKED ❌ (Sentiment Blocked)"
+                        else:
+                            status_text = "READY ✅"
+
+            logger.info(f"  {symbol:<12} {m_label} | {tech_text:<8} | {pred_text:<9} | {ml_conf:.2f} | RSI: {rsi:<5.1f} | {status_text}")
             
             self.dashboard_watchlist.append({
                 "symbol": symbol,
                 "is_futures": bool(is_f),
+                "tech_signal": tech_signal,
                 "ml_class": int(ml_class),
                 "ml_confidence": float(ml_conf),
-                "rsi": float(rsi)
+                "rsi": float(rsi),
+                "status_text": status_text
             })
         
         logger.info("  " + "─" * 45)
@@ -401,7 +494,7 @@ class Trader:
                 open_count += 1
 
     def _evaluate_pair_with_data(self, symbol: str, usdt_balance: float, 
-                                 df_5m: pd.DataFrame, df_1m: pd.DataFrame, df_15m: pd.DataFrame) -> bool:
+                                 df_main: pd.DataFrame, df_lower: pd.DataFrame, df_higher: pd.DataFrame) -> bool:
         """Evaluate a pair using provided (cached) data. Returns True if position was opened."""
         # ── Cooldown Check ────────────────────────────────────
         last_exit = self.cooldowns.get(symbol, 0)
@@ -409,16 +502,15 @@ class Trader:
         if elapsed < self.cooldown_minutes:
             return False
 
-        df_5m = self.strategy.calculate(df_5m)
-        signal, _ = self.strategy.get_signal(df_5m)
+        is_f = self.exchange.is_futures(symbol)
 
-        # ── Full AI Mode Decision (MTF Enabled) ───────────────
+        # ── ML Full AI Mode / Confirmation Mode / Pure Technical ──
         if config.ML_ENABLED and config.ML_FULL_AI_MODE:
             ml_class, ml_confidence = self._ml_scores.get(symbol, (0, 0.0))
-            if ml_class == 0: return False
-
+            if ml_class not in (1, 2) or ml_confidence < config.ML_CONFIDENCE_THRESHOLD:
+                return False
+            
             side = "BUY" if ml_class == 1 else "SELL"
-            is_f = self.exchange.is_futures(symbol)
             
             # Safeguard: Spot cannot SHORT
             if not is_f and side == "SELL":
@@ -427,14 +519,39 @@ class Trader:
             if side == "BUY" and self.sentiment.is_blocked(symbol):
                 return False
 
-            if ml_confidence < config.ML_CONFIDENCE_THRESHOLD:
-                return False
-
             market_text = "FUTURES" if is_f else "SPOT"
-            logger.info(f"🚀 AI SIGNAL | {symbol} ({market_text}) | Side: {side} | Conf: {ml_confidence:.2f} → EXECUTING")
+            logger.info(f"🚀 AI TRIGGERED | {symbol} ({market_text}) | Side: {side} | ML Conf: {ml_confidence:.2f} → EXECUTING")
         else:
-            if signal not in ("BUY", "SELL"): return False
-            side = signal
+            df_main = self.strategy.calculate(df_main)
+            signal, _ = self.strategy.get_signal(df_main)
+
+            if config.ML_ENABLED:
+                if signal not in ("BUY", "SELL"): return False
+                
+                ml_class, ml_confidence = self._ml_scores.get(symbol, (0, 0.0))
+                
+                # Verify if ML confirms the strategy direction:
+                # signal "BUY" is confirmed by ml_class 1 (LONG)
+                # signal "SELL" is confirmed by ml_class 2 (SHORT)
+                is_confirmed = (signal == "BUY" and ml_class == 1) or (signal == "SELL" and ml_class == 2)
+                
+                if not is_confirmed or ml_confidence < config.ML_CONFIDENCE_THRESHOLD:
+                    return False
+                    
+                side = signal
+                
+                # Safeguard: Spot cannot SHORT
+                if not is_f and side == "SELL":
+                    return False
+
+                if side == "BUY" and self.sentiment.is_blocked(symbol):
+                    return False
+
+                market_text = "FUTURES" if is_f else "SPOT"
+                logger.info(f"🚀 AI CONFIRMED | {symbol} ({market_text}) | Side: {side} | ML Conf: {ml_confidence:.2f} → EXECUTING")
+            else:
+                if signal not in ("BUY", "SELL"): return False
+                side = signal
 
         # ── Funding Fee Guard (Futures only) ─────────────────────
         if config.FUNDING_FEE_ENABLED and self.exchange.is_futures(symbol):
@@ -563,6 +680,7 @@ class Trader:
             "testnet":      config.TESTNET,
             "sentiment":    self.sentiment.all_scores(),
             "optimizer_last_run": self.optimizer.last_run,
+            "ml_confidence_threshold": config.ML_CONFIDENCE_THRESHOLD,
         }
 
         if first:
