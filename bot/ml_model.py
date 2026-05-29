@@ -26,13 +26,30 @@ import config
 
 logger = logging.getLogger("bot")
 
-# Standard feature set for the model (25 features with MTF)
+# [MTF] Extended feature set: 25 original + 6 MTF confluence = 31 features
+# Must stay in sync with train_model.py FEATURE_COLS
 FEATURE_COLS = [
+    # ── Original 25 ──
     "ema_cross_gap", "ema_cross_angle", "macd_hist", "rsi", "volatility_pct",
     "volume_spike", "price_change_5", "price_change_3", "hour", "day_of_week",
     "adx", "bb_pct", "atr_norm", "volume_momentum", "dist_ema_fast",
     "dist_ema_slow", "rsi_slope", "high_low_gap", "is_bullish_candle",
-    "rsi_lower", "rsi_higher", "trend_higher", "vol_lower_spike", "range_pct", "rsi_div"
+    "rsi_lower", "rsi_higher", "trend_higher", "vol_lower_spike", "range_pct", "rsi_div",
+    # ── 6 MTF Confluence ──
+    "mtf_alignment_score",
+    "tf_1h_15m_agree",
+    "tf_15m_5m_agree",
+    "tf_all_bearish",
+    "tf_all_bullish",
+    "higher_trend_strength",
+    # ── 7 Fibonacci Retracement ──
+    "fib_dist_0_0",
+    "fib_dist_236",
+    "fib_dist_382",
+    "fib_dist_500",
+    "fib_dist_618",
+    "fib_dist_786",
+    "fib_dist_1_0",
 ]
 
 class MLPredictor:
@@ -49,7 +66,7 @@ class MLPredictor:
         if os.path.exists(self.model_path) and os.path.exists(self.scaler_path):
             try:
                 import torch
-                from bot.nn_model import DayTradingMLP
+                from bot.nn_model import DayTradingCLSTM
 
                 # Use absolute paths to ensure reliability on VPS
                 abs_model_path = os.path.abspath(self.model_path)
@@ -62,15 +79,23 @@ class MLPredictor:
                 # Initialize model architecture and load weights
                 checkpoint = torch.load(abs_model_path, map_location=torch.device('cpu'))
                 if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
-                    hidden_dims = checkpoint.get('hidden_dims', [64, 32])
+                    cnn_channels = checkpoint.get('cnn_channels', 32)
+                    lstm_hidden = checkpoint.get('lstm_hidden', 64)
                     dropout = checkpoint.get('dropout', 0.2)
-                    activation = checkpoint.get('activation', 'relu')
-                    logger.info(f"📦 Loaded model metadata: hidden_dims={hidden_dims}, dropout={dropout}, activation={activation}")
-                    self.model = DayTradingMLP(hidden_dims=hidden_dims, dropout=dropout, activation=activation)
+                    seq_len = checkpoint.get('seq_len', 10)
+                    input_dim = checkpoint.get('input_dim', 38)
+                    logger.info(f"📦 Loaded C-LSTM model metadata: cnn_channels={cnn_channels}, lstm_hidden={lstm_hidden}, seq_len={seq_len}, input_dim={input_dim}")
+                    self.model = DayTradingCLSTM(
+                        input_dim=input_dim,
+                        seq_len=seq_len,
+                        cnn_channels=cnn_channels,
+                        lstm_hidden=lstm_hidden,
+                        dropout=dropout
+                    )
                     self.model.load_state_dict(checkpoint['state_dict'])
                 else:
-                    logger.info("📦 Loaded model (legacy raw state_dict without metadata)")
-                    self.model = DayTradingMLP()
+                    logger.info("📦 Loaded model (legacy raw state_dict without metadata). Initializing default DayTradingCLSTM.")
+                    self.model = DayTradingCLSTM()
                     self.model.load_state_dict(checkpoint)
                 
                 self.model.eval() # Set to evaluation mode for inference
@@ -186,13 +211,77 @@ class MLPredictor:
             df['hour'] = df.index.hour
             df['day_of_week'] = df.index.dayofweek
             df['range_pct'] = (df['high'] - df['low']) / df['close'] * 100
+
+            # ── [MTF] 6 Confluence Features (must match train_model.py exactly) ──
+            dir_15m = np.where(df['ema_9'] > df['ema_21'], 1, -1)
+
+            if df_lower is not None and not df_lower.empty:
+                ema_lower_f = df_lower['close'].ewm(span=9, adjust=False).mean()
+                ema_lower_s = df_lower['close'].ewm(span=21, adjust=False).mean()
+                dir_5m_s = (np.where(ema_lower_f > ema_lower_s, 1, -1))
+                dir_5m_series = pd.Series(dir_5m_s, index=df_lower.index).reindex(df.index, method='ffill').fillna(0)
+            else:
+                dir_5m_series = pd.Series(0, index=df.index)
+
+            dir_1h = df_higher_feat['trend_higher'].fillna(0)
+
+            df['mtf_alignment_score'] = dir_15m + dir_5m_series.values + dir_1h.values
+            df['tf_1h_15m_agree']     = (dir_1h.values == dir_15m).astype(int)
+            df['tf_15m_5m_agree']     = (dir_15m == dir_5m_series.values).astype(int)
+            df['tf_all_bearish']      = (df['mtf_alignment_score'] == -3).astype(int)
+            df['tf_all_bullish']      = (df['mtf_alignment_score'] ==  3).astype(int)
+
+            if df_higher is not None and not df_higher.empty:
+                ema_h9  = df_higher['close'].ewm(span=9,  adjust=False).mean()
+                ema_h21 = df_higher['close'].ewm(span=21, adjust=False).mean()
+                htf_str = ((ema_h9 - ema_h21) / (ema_h21 + 1e-9) * 100).abs()
+                df['higher_trend_strength'] = htf_str.reindex(df.index, method='ffill').fillna(0)
+            else:
+                df['higher_trend_strength'] = 0.0
+            
+            # ── [FIX-FIB] Fibonacci Retracement Levels (50-candle window) ──
+            rolling_high = df['high'].rolling(window=50, min_periods=1).max()
+            rolling_low = df['low'].rolling(window=50, min_periods=1).min()
+            range_diff = rolling_high - rolling_low
+            
+            fib_0_0 = rolling_low
+            fib_236 = rolling_low + 0.236 * range_diff
+            fib_382 = rolling_low + 0.382 * range_diff
+            fib_500 = rolling_low + 0.500 * range_diff
+            fib_618 = rolling_low + 0.618 * range_diff
+            fib_786 = rolling_low + 0.786 * range_diff
+            fib_1_0 = rolling_high
+            
+            df['fib_dist_0_0'] = (df['close'] - fib_0_0) / (df['close'] + 1e-9)
+            df['fib_dist_236'] = (df['close'] - fib_236) / (df['close'] + 1e-9)
+            df['fib_dist_382'] = (df['close'] - fib_382) / (df['close'] + 1e-9)
+            df['fib_dist_500'] = (df['close'] - fib_500) / (df['close'] + 1e-9)
+            df['fib_dist_618'] = (df['close'] - fib_618) / (df['close'] + 1e-9)
+            df['fib_dist_786'] = (df['close'] - fib_786) / (df['close'] + 1e-9)
+            df['fib_dist_1_0'] = (df['close'] - fib_1_0) / (df['close'] + 1e-9)
             
             valid_df = df[FEATURE_COLS].dropna()
-            if len(valid_df) < 2:
-                # Fallback to last row if history is very short
-                return valid_df.iloc[[-1]] if not valid_df.empty else None
-            # Return the last fully completed candle (index -2) to avoid unclosed live candle noise
-            return valid_df.iloc[[-2]]
+            
+            seq_len = getattr(config, 'ML_SEQUENCE_LENGTH', 10)
+            if len(valid_df) < seq_len + 1:
+                return None
+                
+            # Adaptive candle selection:
+            # Default: use the last COMPLETED candle (iloc[-2]) to avoid noise from the live candle.
+            # Exception: if price is moving fast (|price_change_3| > 0.3%), the live candle
+            # already contains critical signal information — use iloc[-1] instead.
+            # This prevents stale 15m-old predictions when the market is pumping/dumping.
+            try:
+                last_price_change = abs(float(valid_df.iloc[-1]["price_change_3"]))
+                use_live_candle = last_price_change > 0.30  # 0.3% move in 3 candles = fast market
+            except Exception:
+                use_live_candle = False
+                
+            if use_live_candle:
+                logger.debug("📡 Fast market detected — using live candle for prediction")
+                return valid_df.iloc[-seq_len:]
+            return valid_df.iloc[-seq_len-1:-1]
+
             
         except Exception as e:
             logger.error(f"Error preparing MTF features: {e}")
@@ -217,8 +306,8 @@ class MLPredictor:
             # Scale features
             features_scaled = self.scaler.transform(features_df.values)
             
-            # Convert to PyTorch tensor
-            features_tensor = torch.tensor(features_scaled, dtype=torch.float32)
+            # Convert to PyTorch tensor and add batch dimension [1, seq_len, feature_dim]
+            features_tensor = torch.tensor(features_scaled, dtype=torch.float32).unsqueeze(0)
             
             # Perform inference
             with torch.no_grad():

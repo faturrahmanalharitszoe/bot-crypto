@@ -79,6 +79,68 @@ def api_trades():
     # Reverse to show most recent first
     trades = list(reversed(trades))
     
+    # Time filtering
+    filter_type = request.args.get('filter', 'all')
+    start_date_str = request.args.get('start_date', '')
+    end_date_str = request.args.get('end_date', '')
+
+    from datetime import datetime as dt_mod, timedelta
+    
+    def parse_datetime(dt_str):
+        if not dt_str:
+            return None
+        dt_str = dt_str.replace('T', ' ').strip()
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+            try:
+                return dt_mod.strptime(dt_str, fmt)
+            except ValueError:
+                continue
+        return None
+
+    filtered_trades = []
+    
+    # Pre-calculate ranges to avoid recalculating in loop
+    now = dt_mod.now()
+    today_str = now.strftime("%Y-%m-%d")
+    yesterday_str = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+    
+    seven_days_ago = now - timedelta(days=7)
+    thirty_days_ago = now - timedelta(days=30)
+    
+    custom_start = parse_datetime(start_date_str)
+    custom_end = parse_datetime(end_date_str)
+
+    for t in trades:
+        ts_str = t.get("timestamp", "")
+        if not ts_str:
+            filtered_trades.append(t)
+            continue
+            
+        trade_dt = parse_datetime(ts_str)
+        if not trade_dt:
+            filtered_trades.append(t)
+            continue
+            
+        trade_date_str = ts_str[:10]  # Get YYYY-MM-DD
+        
+        keep = True
+        if filter_type == 'today':
+            keep = (trade_date_str == today_str)
+        elif filter_type == 'yesterday':
+            keep = (trade_date_str == yesterday_str)
+        elif filter_type == '7d':
+            keep = (trade_dt >= seven_days_ago)
+        elif filter_type == '30d':
+            keep = (trade_dt >= thirty_days_ago)
+        elif filter_type == 'custom':
+            if custom_start and trade_dt < custom_start:
+                keep = False
+            if custom_end and trade_dt > custom_end:
+                keep = False
+                
+        if keep:
+            filtered_trades.append(t)
+
     # Pagination
     try:
         page = int(request.args.get('page', 1))
@@ -89,12 +151,12 @@ def api_trades():
     
     start = (page - 1) * per_page
     end = start + per_page
-    paginated_trades = trades[start:end]
+    paginated_trades = filtered_trades[start:end]
     
-    # Calculate global statistics (over all trades, not just paginated)
+    # Calculate statistics (over the filtered set, not just paginated)
     total_pnl = 0.0
     wins = 0
-    for t in trades:
+    for t in filtered_trades:
         try:
             pnl_val = float(t.get("pnl_usdt", 0) or 0)
             total_pnl += pnl_val
@@ -105,12 +167,13 @@ def api_trades():
             
     return jsonify({
         "trades": paginated_trades,
-        "total": len(trades),
+        "total": len(filtered_trades),
         "page": page,
         "per_page": per_page,
         "total_pnl": total_pnl,
         "wins": wins
     })
+
 
 def start_web_server(port: int = 5050) -> None:
     t = threading.Thread(
@@ -318,7 +381,7 @@ tr:hover td{background:rgba(255,255,255,.02)}
   <!-- Main: Positions + Watchlist -->
   <div class="main-grid">
     <div class="card">
-      <div class="card-title">Open Positions (<span id="pos-count">0</span>/<span id="pos-max">3</span>)</div>
+      <div class="card-title">Open Positions (<span id="pos-count">0</span>/<span id="pos-max">1</span>)</div>
       <div id="pos-area"><div class="no-pos"><div class="ico">📡</div><div>Scanning for signals...</div></div></div>
     </div>
     <div class="card">
@@ -329,7 +392,25 @@ tr:hover td{background:rgba(255,255,255,.02)}
 
   <!-- Trades -->
   <div class="card" style="margin-bottom:14px">
-    <div class="card-title">Recent Trades</div>
+    <div class="card-title" style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
+      <span>Recent Trades</span>
+      <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+        <select id="time-filter" onchange="onFilterChange(this.value)" class="per-page-select" style="padding: 4px 8px; font-size:12px; height: 28px;">
+          <option value="all">All Time</option>
+          <option value="today">Today</option>
+          <option value="yesterday">Yesterday</option>
+          <option value="7d">Last 7 Days</option>
+          <option value="30d">Last 30 Days</option>
+          <option value="custom">Custom Range</option>
+        </select>
+        <div id="custom-date-range" style="display: none; align-items: center; gap: 6px;">
+          <input type="datetime-local" id="start-date" class="per-page-select" style="padding: 2px 6px; font-size:11px; height: 28px; color-scheme: dark;" onchange="onCustomDateChange()">
+          <span style="font-size: 11px; color: var(--muted)">to</span>
+          <input type="datetime-local" id="end-date" class="per-page-select" style="padding: 2px 6px; font-size:11px; height: 28px; color-scheme: dark;" onchange="onCustomDateChange()">
+        </div>
+      </div>
+    </div>
+
     <div style="overflow-x:auto">
       <table>
         <thead><tr>
@@ -384,12 +465,29 @@ function renderPositions(positions){
     const sideCls=p.side==='BUY'?'side-long':'side-short';
     const sideLabel=p.side==='BUY'?'LONG':'SHORT';
     const isFut=p.is_futures!==false;
+    
+    // Parse opened_at to local string format
+    let timeStr = '—';
+    if (p.opened_at) {
+      try {
+        const dObj = new Date(p.opened_at);
+        if (!isNaN(dObj.getTime())) {
+          const pad = (num) => String(num).padStart(2, '0');
+          timeStr = dObj.getFullYear() + '-' + pad(dObj.getMonth()+1) + '-' + pad(dObj.getDate()) + ' ' + 
+                    pad(dObj.getHours()) + ':' + pad(dObj.getMinutes()) + ':' + pad(dObj.getSeconds());
+        }
+      } catch(e) {}
+    }
+    
     return `<div class="pos-item">
       <div class="pos-head">
         <span class="pos-sym">${p.symbol||'—'}</span>
         <span class="side-badge ${sideCls}">${sideLabel}</span>
         ${isFut?'<span class="mbadge mf">F</span>':'<span class="mbadge ms">S</span>'}
         <span style="margin-left:auto;font-size:11px;color:var(--muted)">${fmt(p.duration_min,1)} min</span>
+      </div>
+      <div style="font-size:11px;color:var(--muted);margin-bottom:10px;margin-top:-6px;">
+        Opened: <span style="color:var(--text);font-family:var(--mono)">${timeStr}</span>
       </div>
       <div class="pos-grid">
         <div><div class="pf">Entry</div><div class="pv">${fmt(p.entry_price)}</div></div>
@@ -421,14 +519,22 @@ function renderPositions(positions){
 function renderWatchlist(wl){
   const el=document.getElementById('watchlist');
   if(!wl||!wl.length){el.innerHTML='<div style="color:var(--muted);font-size:13px;padding:20px 0;text-align:center">No data</div>';return;}
-  const threshold = window.mlThreshold || 0.65;
+  const threshold = window.mlThreshold || 0.68;
   el.innerHTML=wl.map(p=>{
     const ts=p.tech_signal||'HOLD', mc=p.ml_class||0, conf=p.ml_confidence||0, rsi=p.rsi||50;
+    const adx=p.adx||0, adxOk=p.adx_ok||false;
     
     // Tech signal styling
     let techHtml='<span class="bias-hold" style="font-weight:600">HOLD ⚪</span>';
     if(ts==='BUY') techHtml='<span class="bias-long" style="font-weight:600">BUY 🟢</span>';
     if(ts==='SELL') techHtml='<span class="bias-short" style="font-weight:600">SELL 🔴</span>';
+    
+    // Market condition badge based on ADX
+    let mktCondHtml='';
+    if(adx<15) mktCondHtml='<span style="font-size:9px;padding:1px 5px;border-radius:3px;background:rgba(255,71,87,.12);color:var(--red);border:1px solid rgba(255,71,87,.25)">RANGING</span>';
+    else if(adx<20) mktCondHtml='<span style="font-size:9px;padding:1px 5px;border-radius:3px;background:rgba(251,191,36,.12);color:var(--yellow);border:1px solid rgba(251,191,36,.25)">WEAK</span>';
+    else if(adx<30) mktCondHtml='<span style="font-size:9px;padding:1px 5px;border-radius:3px;background:rgba(0,229,160,.12);color:var(--green);border:1px solid rgba(0,229,160,.25)">TRENDING</span>';
+    else mktCondHtml='<span style="font-size:9px;padding:1px 5px;border-radius:3px;background:rgba(0,229,160,.2);color:var(--green);border:1px solid rgba(0,229,160,.4)">STRONG 🔥</span>';
     
     // AI Confirmation styling
     let aiHtml='<span style="color:var(--muted);font-size:11px">HOLD ⚪</span>';
@@ -466,18 +572,26 @@ function renderWatchlist(wl){
     if(mc===2) mlDir = 'SHORT';
     
     const mBadge=p.is_futures?'<span class="mbadge mf">F</span>':'<span class="mbadge ms">S</span>';
-    const rsiCls=rsi>70?'red':(rsi<30?'green':'');
+    const rsiCls=rsi>68?'red':(rsi<32?'green':'');
+    const adxCls=adxOk?'green':'red';
     const confPct=Math.round(conf*100);
-    return `<div class="wl-item">
+    return `<div class="wl-item" style="grid-template-columns:auto 1fr auto auto">
       <div>
         ${mBadge}
         <span class="wl-sym">${p.symbol}</span>
-        <div class="conf-bar" style="width:${confPct}%;background:${barClr};max-width:60px"></div>
+        <div style="display:flex;gap:4px;align-items:center;margin-top:3px">
+          ${mktCondHtml}
+          <div class="conf-bar" style="width:${confPct}%;background:${barClr};max-width:50px"></div>
+        </div>
         <div class="wl-sub">AI: ${mlDir} ${confPct}%</div>
       </div>
       <div style="padding-left:4px;display:flex;flex-direction:column;gap:2px">
         <div>${techHtml}</div>
         <div>${aiHtml}</div>
+      </div>
+      <div style="text-align:center">
+        <div class="wl-rsi ${adxCls}" style="font-size:12px">${adx.toFixed(0)}</div>
+        <div style="font-size:9px;color:var(--muted)">ADX</div>
       </div>
       <div class="wl-rsi ${rsiCls}">${rsi.toFixed(1)}<div style="font-size:9px;color:var(--muted)">RSI</div></div>
     </div>`;
@@ -524,13 +638,38 @@ async function refreshStatus(){
   }catch(e){document.getElementById('run-txt').textContent='Offline';}
 }
 
-// Global variables for pagination
+// Global variables for pagination and filtering
 let currentTradesPage = 1;
 let tradesPerPage = 50;
+let currentFilter = 'all';
+let filterStartDate = '';
+let filterEndDate = '';
+
+function onFilterChange(val) {
+    currentFilter = val;
+    const customDiv = document.getElementById('custom-date-range');
+    if (val === 'custom') {
+        customDiv.style.display = 'inline-flex';
+    } else {
+        customDiv.style.display = 'none';
+        filterStartDate = '';
+        filterEndDate = '';
+        currentTradesPage = 1;
+        refreshTrades();
+    }
+}
+
+function onCustomDateChange() {
+    filterStartDate = document.getElementById('start-date').value;
+    filterEndDate = document.getElementById('end-date').value;
+    currentTradesPage = 1;
+    refreshTrades();
+}
 
 async function refreshTrades(){
     try{
-        const response = await fetch(`api/trades?page=${currentTradesPage}&per_page=${tradesPerPage}`);
+        const url = `api/trades?page=${currentTradesPage}&per_page=${tradesPerPage}&filter=${currentFilter}&start_date=${filterStartDate}&end_date=${filterEndDate}`;
+        const response = await fetch(url);
         const data = await response.json();
         const trades = data.trades;
         const total = data.total;
@@ -540,6 +679,25 @@ async function refreshTrades(){
         const totalPnl = parseFloat(data.total_pnl || 0);
         const wins = parseInt(data.wins || 0);
         const n = trades.length;
+
+        // Update stats labels based on filter type
+        const labelMap = {
+            'all': 'Total P&L',
+            'today': "Today's P&L",
+            'yesterday': "Yesterday's P&L",
+            '7d': '7-Day P&L',
+            '30d': '30-Day P&L',
+            'custom': 'Custom P&L'
+        };
+        const pnlLabel = document.querySelector('#s-pnl + .stat-l');
+        if (pnlLabel) pnlLabel.textContent = labelMap[currentFilter] || 'Session P&L';
+        
+        const tcLabel = document.querySelector('#s-tc + .stat-l');
+        if (tcLabel) tcLabel.textContent = currentFilter === 'all' ? 'Total Trades' : 'Filtered Trades';
+        
+        const wrLabel = document.querySelector('#s-wr + .stat-l');
+        if (wrLabel) wrLabel.textContent = currentFilter === 'all' ? 'Win Rate' : 'Filtered Win Rate';
+
         document.getElementById('s-tc').textContent=total;
         const pe=document.getElementById('s-pnl');
         pe.textContent=(totalPnl>=0?'+':'')+totalPnl.toFixed(4)+' USDT';
@@ -549,9 +707,17 @@ async function refreshTrades(){
 
         const rMap={'TAKE_PROFIT':['Take Profit','tp'],'STOP_LOSS':['Stop Loss','sl'],
           'TRAILING_STOP':['Trailing','trail'],'REVERSAL_SIGNAL':['Reversal','rev'],
-          'MAX_HOLD':['Timeout','mh']};
+          'ML_REVERSAL':['AI Reversal','rev'],'ML_EXHAUSTION':['AI Exhaustion','mh'],
+          'MAX_HOLD':['Timeout','mh'],'BREAK_EVEN':['Break Even','trail']};
         const tbody=document.getElementById('t-body');
-        if(!n){tbody.innerHTML='<tr><td colspan="10" class="no-trades">No trades yet — waiting for signals...</td></tr>';return;}
+        if(!n){
+            tbody.innerHTML='<tr><td colspan="10" class="no-trades">No trades found for this time range</td></tr>';
+            let existingPagination = document.querySelector('.card:has(#t-body)').querySelector('.trades-pagination');
+            if (existingPagination) {
+                existingPagination.remove();
+            }
+            return;
+        }
         tbody.innerHTML=trades.map(t=>{
             const pnl=parseFloat(t.pnl_usdt||0);
             const cls=pnl>=0?'green':'red';

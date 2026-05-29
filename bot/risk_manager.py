@@ -48,9 +48,15 @@ class Position:
         self.candles_held: int = 0
         
         # Protection tracking
-        self.peak_price: float = entry_price # Best price reached (High for Long, Low for Short)
+        # [REVAMP] For SHORT positions, peak_price should start at entry (lowest favorable price)
+        # For LONG positions, peak_price starts at entry (highest favorable price)
+        self.peak_price: float = entry_price
         self.trailing_active: bool = False
         self.be_active: bool = False
+
+        # Caching for exit signal checks to rate limit heavy API calls
+        self.last_signal_check_time: float = 0.0
+        self.cached_reversal_signal = False
 
     def to_dict(self) -> dict:
         """Convert position to serializable dict."""
@@ -214,11 +220,15 @@ class RiskManager:
         quantity: float,
         side: str = "BUY",
         is_futures: bool = False,
+        tp_pct: Optional[float] = None,
+        sl_pct: Optional[float] = None,
     ) -> Position:
         """Record a newly opened position."""
         # Use futures-specific TP/SL if available, otherwise spot
-        tp_pct = config.FUTURES_TAKE_PROFIT_PCT if is_futures else config.TAKE_PROFIT_PCT
-        sl_pct = config.FUTURES_STOP_LOSS_PCT   if is_futures else config.STOP_LOSS_PCT
+        if tp_pct is None:
+            tp_pct = config.FUTURES_TAKE_PROFIT_PCT if is_futures else config.TAKE_PROFIT_PCT
+        if sl_pct is None:
+            sl_pct = config.FUTURES_STOP_LOSS_PCT   if is_futures else config.STOP_LOSS_PCT
 
         if side == "BUY":
             take_profit = entry_price * (1 + tp_pct)
@@ -264,6 +274,8 @@ class RiskManager:
         usdt_balance: float,
         current_price: float,
         symbol_info: dict,
+        sl_pct: Optional[float] = None,
+        is_futures: bool = False,
     ) -> float:
         """
         Calculate how many units to buy given:
@@ -281,6 +293,17 @@ class RiskManager:
 
         # Account for estimated fee in the spend amount
         usdt_to_spend *= (1 - FEE_RATE)
+
+        # [REVAMP] For futures: apply leverage to increase buying power
+        # $16 margin × 5x leverage = $80 notional position
+        if is_futures and config.FUTURES_LEVERAGE > 1:
+            usdt_to_spend *= config.FUTURES_LEVERAGE
+
+        # Scale position size based on dynamic stop loss to keep dollar risk constant
+        if sl_pct is not None:
+            base_sl = config.FUTURES_STOP_LOSS_PCT if is_futures else config.STOP_LOSS_PCT
+            if base_sl > 0 and sl_pct > 0:
+                usdt_to_spend *= (base_sl / sl_pct)
 
         raw_qty  = usdt_to_spend / current_price
         step     = symbol_info.get("step_size", 0.001)

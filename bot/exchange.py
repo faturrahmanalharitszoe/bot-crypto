@@ -36,6 +36,26 @@ class Exchange:
             testnet=self.testnet,
         )
 
+        # ── [FIX] Force Futures DEMO URL when in demo/testnet mode ────────
+        # The user is using Binance Spot Demo / Futures Demo, which requires
+        # the demo futures base endpoint (not the normal futures testnet URL).
+        # Using the wrong futures endpoint causes -1109 Invalid account.
+        if self.testnet and config.FUTURES_ENABLED:
+            # Binance Futures Demo API base endpoint.
+            # Docs: https://developers.binance.com/docs/derivatives/
+            #
+            # ⚠️ CRITICAL: python-binance's _create_futures_api_uri() does:
+            #     if self.testnet: url = self.FUTURES_TESTNET_URL
+            # So we MUST override FUTURES_TESTNET_URL (not FUTURES_URL) for
+            # demo Futures API keys (from demo.binance.com / demo-fapi.binance.com)
+            # to work. The default points to testnet.binancefuture.com which
+            # is a *different* environment that rejects demo keys with -1109.
+            self.client.FUTURES_TESTNET_URL = "https://demo-fapi.binance.com/fapi"
+            self.client.FUTURES_DATA_TESTNET_URL = "https://demo-fapi.binance.com/futures/data"
+            self.client.FUTURES_COIN_TESTNET_URL = "https://demo-dapi.binance.com/dapi"
+            self.client.FUTURES_COIN_DATA_TESTNET_URL = "https://demo-dapi.binance.com/futures/data"
+            logger.info(f"Futures demo URL override: {self.client.FUTURES_TESTNET_URL}")
+
         # ── Sync clock offset with Binance server ─────────
         self._sync_server_time()
 
@@ -48,10 +68,91 @@ class Exchange:
         except Exception as e:
             logger.warning(f"Could not fetch Futures symbols: {e}. Falling back to Spot only.")
 
+        # Cache initial testnet wallet balance baseline (persistent across restarts)
+        self._initial_testnet_wallet_balance = 5000.0
+        if self.testnet:
+            current_config_mock = float(getattr(config, "MOCK_TESTNET_BALANCE", 0.0))
+            if current_config_mock > 0.0:
+                import json
+                import os
+                state_file = os.path.join("logs", "mock_balance_state.json")
+                
+                # Fetch current raw collateral balance as a fallback/starting value
+                current_raw = 5000.0
+                try:
+                    if config.FUTURES_ENABLED:
+                        info = self.client.futures_account_balance()
+                        for asset in info:
+                            if asset["asset"] == "USDT":
+                                current_raw = float(asset.get("balance") or 5000.0)
+                                break
+                    else:
+                        info = self.client.get_asset_balance(asset="USDT")
+                        if info:
+                            current_raw = float(info.get("free", 0.0)) + float(info.get("locked", 0.0))
+                except Exception as e:
+                    logger.warning(f"Could not fetch current raw balance from Binance: {e}")
+                    
+                # Try to load existing state
+                loaded_initial_raw = None
+                if os.path.exists(state_file):
+                    try:
+                        with open(state_file, "r", encoding="utf-8") as f:
+                            state_data = json.load(f)
+                        # Only reuse the raw baseline if the mock starting balance hasn't changed in the config
+                        if state_data.get("mock_starting_balance") == current_config_mock:
+                            loaded_initial_raw = state_data.get("initial_raw_balance")
+                            logger.info(
+                                f"ℹ️ Loaded persistent mock balance baseline. "
+                                f"Starting: ${current_config_mock:.2f} USDT | "
+                                f"Raw baseline: ${loaded_initial_raw:.2f} USDT"
+                            )
+                        else:
+                            logger.info(
+                                f"ℹ️ Mock starting balance in config changed "
+                                f"({state_data.get('mock_starting_balance')} -> {current_config_mock}). "
+                                f"Resetting baseline."
+                            )
+                    except Exception as e:
+                        logger.warning(f"Could not read mock balance state file: {e}. Resetting baseline.")
+                
+                if loaded_initial_raw is not None:
+                    self._initial_testnet_wallet_balance = loaded_initial_raw
+                else:
+                    # Save new state
+                    self._initial_testnet_wallet_balance = current_raw
+                    try:
+                        os.makedirs("logs", exist_ok=True)
+                        with open(state_file, "w", encoding="utf-8") as f:
+                            json.dump({
+                                "initial_raw_balance": current_raw,
+                                "mock_starting_balance": current_config_mock
+                            }, f, indent=4)
+                        logger.info(f"ℹ️ Saved new mock balance baseline: starting={current_config_mock:.2f}, raw={current_raw:.2f}")
+                    except Exception as e:
+                        logger.error(f"Could not write mock balance state: {e}")
+            else:
+                # Mocking is disabled, just fetch raw balance for baseline
+                try:
+                    if config.FUTURES_ENABLED:
+                        info = self.client.futures_account_balance()
+                        for asset in info:
+                            if asset["asset"] == "USDT":
+                                self._initial_testnet_wallet_balance = float(asset.get("balance") or 5000.0)
+                                break
+                    else:
+                        info = self.client.get_asset_balance(asset="USDT")
+                        if info:
+                            self._initial_testnet_wallet_balance = float(info.get("free", 0.0)) + float(info.get("locked", 0.0))
+                    logger.info(f"ℹ️ Testnet initial wallet balance baseline: ${self._initial_testnet_wallet_balance:.2f} USDT")
+                except Exception as e:
+                    logger.warning(f"Could not fetch initial testnet balance: {e}. Using 5000.0 as baseline.")
+
         mode = "🧪 TESTNET" if self.testnet else "🔴 LIVE"
         market = "📈 FUTURES (Hybrid)" if config.FUTURES_ENABLED else "💰 SPOT"
         logger.info(f"Exchange initialized — Mode: {mode} | Market: {market}")
         self._symbol_info_cache: dict = {}
+
 
     # ── Server Time Sync ─────────────────────────────────────
 
@@ -78,22 +179,34 @@ class Exchange:
     def get_usdt_balance(self) -> float:
         """Return available USDT balance (Spot or Futures)."""
         try:
+            raw_balance = 0.0
             if config.FUTURES_ENABLED:
                 info = self.client.futures_account_balance()
                 # Find USDT in the list of assets
                 for asset in info:
                     if asset["asset"] == "USDT":
                         # Try multiple possible keys (withdrawAvailable, availableBalance, balance)
-                        return float(asset.get("withdrawAvailable") or 
-                                     asset.get("availableBalance") or 
-                                     asset.get("balance") or 0.0)
-                return 0.0
+                        raw_balance = float(asset.get("withdrawAvailable") or 
+                                            asset.get("availableBalance") or 
+                                            asset.get("balance") or 0.0)
+                        break
             else:
                 info = self.client.get_asset_balance(asset="USDT")
-                return float(info["free"]) if info else 0.0
+                raw_balance = float(info["free"]) if info else 0.0
+
+            if self.testnet and getattr(config, "MOCK_TESTNET_BALANCE", 0.0) > 0.0:
+                initial = getattr(self, "_initial_testnet_wallet_balance", 5000.0)
+                # Mock balance fluctuates relative to starting wallet balance
+                mocked = float(config.MOCK_TESTNET_BALANCE) + (raw_balance - initial)
+                return max(0.0, mocked)
+
+            return raw_balance
         except BinanceAPIException as e:
             logger.error(f"Failed to fetch USDT balance: {e}")
+            if self.testnet and getattr(config, "MOCK_TESTNET_BALANCE", 0.0) > 0.0:
+                return float(config.MOCK_TESTNET_BALANCE)
             return 0.0
+
 
     def get_asset_balance(self, asset: str) -> float:
         """Return available balance for a given asset (e.g. 'BTC')."""
@@ -226,14 +339,17 @@ class Exchange:
         """Check if a symbol is available on the Futures market."""
         return symbol in self.futures_symbols
 
-    def get_active_symbols(self) -> set:
+    def get_active_symbols(self) -> Optional[set]:
         """Return a set of all symbols that are currently in TRADING status on Spot and/or Futures."""
         active = set()
+        spot_success = False
+        futures_success = False
         try:
             spot_info = self.client.get_exchange_info()
             for s in spot_info.get('symbols', []):
                 if s.get('status') == 'TRADING':
                     active.add(s['symbol'])
+            spot_success = True
         except Exception as e:
             logger.warning(f"Failed to fetch active Spot symbols: {e}")
 
@@ -243,10 +359,18 @@ class Exchange:
                 for s in futures_info.get('symbols', []):
                     if s.get('status') == 'TRADING':
                         active.add(s['symbol'])
+                futures_success = True
+            else:
+                futures_success = True
         except Exception as e:
             logger.warning(f"Failed to fetch active Futures symbols: {e}")
             
+        if not spot_success and not futures_success:
+            return None
+        if not active:
+            return None
         return active
+
 
     # ── Symbol Info ──────────────────────────────────────────
 
@@ -294,11 +418,15 @@ class Exchange:
                     parsed["min_qty"]   = float(f["minQty"])
                     step = float(f["stepSize"])
                     if 0 < step < 1:
-                        parsed["base_precision"] = int(round(-math.log10(step)))
+                        try:
+                            parsed["base_precision"] = int(round(-math.log10(step)))
+                        except ValueError:
+                            parsed["base_precision"] = 0
                     else:
                         parsed["base_precision"] = 0
                 elif ftype in ("MIN_NOTIONAL", "NOTIONAL"):
                     parsed["min_notional"] = float(f.get("minNotional", f.get("notional", 5.0)))
+
 
             self._symbol_info_cache[symbol] = parsed
             return parsed
@@ -310,25 +438,62 @@ class Exchange:
     # ── Futures Specific ─────────────────────────────────────
 
     def setup_futures_symbol(self, symbol: str) -> bool:
-        """Set leverage and margin type for a futures symbol."""
+        """Set leverage and margin type for a futures symbol.
+
+        On Binance Futures Demo, margin type / leverage changes via API often
+        return -1109 ("Invalid account") even when auth is valid. In that case
+        we treat the call as a soft failure and proceed with the order using
+        whatever defaults the demo account has configured (set in the UI).
+        """
         if not config.FUTURES_ENABLED: return True
+
+        soft_fail = False  # True if API rejected config but auth is fine
+
         try:
             # 1. Set Margin Type
             try:
                 self.client.futures_change_margin_type(
-                    symbol=symbol, 
+                    symbol=symbol,
                     marginType=config.FUTURES_MARGIN_TYPE
                 )
             except BinanceAPIException as e:
-                if "No need to change margin type" not in str(e):
+                msg = str(e)
+                if "No need to change margin type" in msg:
+                    pass  # Already set — fine
+                elif "-1109" in msg or "Invalid account" in msg:
+                    # Demo accounts often reject this — proceed anyway.
+                    logger.warning(
+                        f"⚠️  {symbol} margin type change rejected (-1109). "
+                        f"Using account default. (Common on Futures Demo)"
+                    )
+                    soft_fail = True
+                else:
                     logger.warning(f"Could not set margin type for {symbol}: {e}")
 
-            # 2. Set Leverage
-            self.client.futures_change_leverage(
-                symbol=symbol, 
-                leverage=config.FUTURES_LEVERAGE
-            )
+            # 2. Set Leverage (skip if margin already soft-failed to avoid spam)
+            if not soft_fail:
+                try:
+                    self.client.futures_change_leverage(
+                        symbol=symbol,
+                        leverage=config.FUTURES_LEVERAGE
+                    )
+                except BinanceAPIException as e:
+                    msg = str(e)
+                    if "-1109" in msg or "Invalid account" in msg:
+                        logger.warning(
+                            f"⚠️  {symbol} leverage change rejected (-1109). "
+                            f"Using account default."
+                        )
+                        soft_fail = True
+                    else:
+                        logger.warning(f"Could not set leverage for {symbol}: {e}")
+
+            # Even if config calls failed, return True so the order is attempted.
+            # The actual order endpoint may still succeed using account defaults.
             return True
+        except BinanceAPIException as e:
+            logger.error(f"Failed to setup futures for {symbol}: {e}")
+            return False
         except Exception as e:
             logger.error(f"Failed to setup futures for {symbol}: {e}")
             return False
@@ -341,8 +506,10 @@ class Exchange:
             use_f = config.FUTURES_ENABLED and self.is_futures(symbol)
             
             if use_f:
-                # Ensure leverage/margin is set first
-                self.setup_futures_symbol(symbol)
+                # Ensure leverage/margin is set first — abort if setup fails
+                if not self.setup_futures_symbol(symbol):
+                    logger.error(f"Futures setup failed for {symbol} — cannot place order. Check API key permissions.")
+                    return None
                 order = self.client.futures_create_order(
                     symbol=symbol,
                     side=side,

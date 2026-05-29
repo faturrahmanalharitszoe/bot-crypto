@@ -10,6 +10,8 @@ import config
 config.FUTURES_ENABLED = True
 exchange = Exchange()
 
+print("get_usdt_balance():", exchange.get_usdt_balance())
+
 try:
     info = exchange.client.futures_account_balance()
     usdt_asset = None
@@ -18,6 +20,5 @@ try:
             usdt_asset = asset
             break
     print("USDT Asset Info:", usdt_asset)
-    print("get_usdt_balance():", exchange.get_usdt_balance())
 except Exception as e:
-    print("Error:", e)
+    print("API account balance error:", e)
